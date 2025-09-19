@@ -1,6 +1,6 @@
 # sem_psd_gui.py
 # Desktop GUI (PySide6) for SEM particle-size analysis with click-to-exclude blobs.
-# Fix: robust "Threshold" tab rendering (raw & processed masks, safe QLabel scaling)
+# Fullscreen-friendly image viewer (auto-fit), robust Threshold rendering.
 
 from __future__ import annotations
 import sys, math, re, csv
@@ -10,16 +10,20 @@ import numpy as np
 import cv2
 from PIL import Image
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QPixmap, QAction
+# PySide6
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QPixmap, QAction, QTransform, QPainter
 from PySide6.QtWidgets import (
     QApplication, QWidget, QFileDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QFormLayout, QDoubleSpinBox, QSpinBox, QTabWidget, QComboBox, QCheckBox,
-    QMessageBox, QSplitter, QTableWidget, QTableWidgetItem, QHeaderView
+    QMessageBox, QSplitter, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy,
+    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 )
 
+# Matplotlib
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+
 
 # ---------------- Utilities ----------------
 
@@ -254,14 +258,101 @@ def np_to_qpix(img: np.ndarray) -> QPixmap:
     qim = QImage(qimg.data, w, h, 3 * w, QImage.Format_RGB888)
     return QPixmap.fromImage(qim)
 
-# ---------------- Qt widgets ----------------
+
+# ---------------- ImageView (zoom/pan + auto-fit) ----------------
+
+class ImageView(QGraphicsView):
+    sig_clicked = Signal(int, int)  # image coords
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setScene(QGraphicsScene(self))
+        self._item = QGraphicsPixmapItem()
+        self.scene().addItem(self._item)
+        self._img_w = 0
+        self._img_h = 0
+        self._auto_fit = True
+
+        self.setRenderHints(self.renderHints() | QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setFrameShape(QGraphicsView.NoFrame)
+
+    def set_image(self, np_img: np.ndarray | QPixmap):
+        pm = np_img if isinstance(np_img, QPixmap) else np_to_qpix(np_img)
+        self._item.setPixmap(pm)
+        self._img_w = pm.width()
+        self._img_h = pm.height()
+        self._auto_fit = True
+        self.fit_to_view()
+
+    def fit_to_view(self):
+        if self._img_w == 0 or self.width() < 5 or self.height() < 5:
+            return
+        self.setTransform(QTransform())  # reset zoom
+        r = self._item.boundingRect()
+        m = 2  # small margin px
+        self.fitInView(r.adjusted(m, m, -m, -m), Qt.KeepAspectRatio)
+
+    def resizeEvent(self, e):
+        if self._auto_fit and self._img_w:
+            self.fit_to_view()
+        super().resizeEvent(e)
+
+    def wheelEvent(self, e):
+        if self._img_w == 0:
+            return
+        self._auto_fit = False
+        factor = 1.15 if e.angleDelta().y() > 0 else 1/1.15
+        self.scale(factor, factor)
+
+    def mouseDoubleClickEvent(self, e):
+        self._auto_fit = True
+        self.fit_to_view()
+        super().mouseDoubleClickEvent(e)
+
+    def keyPressEvent(self, e):
+        if e.modifiers() & Qt.ControlModifier:
+            if e.key() == Qt.Key_1:
+                self._auto_fit = False
+                self.setTransform(QTransform())  # 100%
+                e.accept(); return
+            if e.key() == Qt.Key_0:
+                self._auto_fit = True
+                self.fit_to_view()
+                e.accept(); return
+            if e.key() == Qt.Key_Plus:
+                self._auto_fit = False; self.scale(1.15, 1.15); e.accept(); return
+            if e.key() == Qt.Key_Minus:
+                self._auto_fit = False; self.scale(1/1.15, 1/1.15); e.accept(); return
+        super().keyPressEvent(e)
+
+    def mousePressEvent(self, e):
+        if self._img_w:
+            # map to image coords and emit
+            p = self.mapToScene(e.pos())
+            x = int(round(p.x()))
+            y = int(round(p.y()))
+            # clamp
+            x = max(0, min(self._img_w - 1, x))
+            y = max(0, min(self._img_h - 1, y))
+            self.sig_clicked.emit(x, y)
+        super().mousePressEvent(e)
+
+
+# ---------------- Qt helper widgets ----------------
 
 class MplWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.fig = Figure(figsize=(5, 4))
         self.canvas = FigureCanvas(self.fig)
-        layout = QVBoxLayout(self); layout.addWidget(self.canvas)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.canvas)
+
     def plot_hist(self, d_um: np.ndarray, st: dict, title: str):
         self.fig.clear(); ax = self.fig.add_subplot(111)
         if d_um.size:
@@ -271,6 +362,7 @@ class MplWidget(QWidget):
             ax.set_xlabel("Particle diameter (µm)"); ax.set_ylabel("Count"); ax.set_title(title)
             ax.grid(True); ax.legend()
         self.canvas.draw()
+
     def plot_cum(self, d_um: np.ndarray, st: dict):
         self.fig.clear(); ax = self.fig.add_subplot(111)
         if d_um.size:
@@ -281,6 +373,7 @@ class MplWidget(QWidget):
             ax.set_xlabel("Particle diameter (µm)"); ax.set_ylabel("Cumulative %"); ax.set_title("Cumulative PSD")
             ax.grid(True); ax.legend()
         self.canvas.draw()
+
 
 # ---------------- App ----------------
 
@@ -307,6 +400,7 @@ class Params:
     min_neck_um: float
     min_seg_d_um: float
 
+
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -316,10 +410,10 @@ class MainWindow(QWidget):
         # State
         self.image_path: Path | None = None
         self.gray: np.ndarray | None = None
-        self.overlay: np.ndarray | None = None
+        self.overlay_img: np.ndarray | None = None
         self.lev: np.ndarray | None = None
-        self.thr_raw: np.ndarray | None = None   # NEW
-        self.thr_proc: np.ndarray | None = None  # NEW
+        self.thr_raw: np.ndarray | None = None
+        self.thr_proc: np.ndarray | None = None
         self.diams_um: np.ndarray = np.array([], float)
         self.stats: dict = {}
         self.um_per_px_from_meta: float | None = None
@@ -330,14 +424,15 @@ class MainWindow(QWidget):
 
         self.build_ui()
 
-    # ---------- UI builders ----------
+    # ---------- UI ----------
 
     def build_ui(self):
         topbar = QHBoxLayout()
         self.btn_open = QPushButton("Open image…"); self.btn_open.clicked.connect(self.open_image)
-        self.meta_label = QLabel("Scale: —"); self.meta_label.setStyleSheet("color: #666")
+        self.meta_label = QLabel("Scale: —"); self.meta_label.setStyleSheet("color:#666")
         topbar.addWidget(self.btn_open); topbar.addWidget(self.meta_label); topbar.addStretch(1)
 
+        # Left controls
         left = QWidget(); form = QFormLayout(left)
 
         self.sb_scale = QDoubleSpinBox(); self.sb_scale.setRange(1e-6, 1000.0); self.sb_scale.setDecimals(6); self.sb_scale.setValue(0.0)
@@ -346,6 +441,7 @@ class MainWindow(QWidget):
         self.cb_autoscale = QPushButton("Read scale from metadata"); self.cb_autoscale.clicked.connect(self.read_scale_meta)
         form.addRow(" ", self.cb_autoscale)
 
+        # ROI
         self.sb_top = QDoubleSpinBox(); self.sb_top.setRange(0,0.9); self.sb_top.setSingleStep(0.01); self.sb_top.setValue(0.02)
         self.sb_bottom = QDoubleSpinBox(); self.sb_bottom.setRange(0,0.9); self.sb_bottom.setSingleStep(0.01); self.sb_bottom.setValue(0.22)
         self.sb_left = QDoubleSpinBox(); self.sb_left.setRange(0,0.9); self.sb_left.setSingleStep(0.01); self.sb_left.setValue(0.0)
@@ -356,20 +452,24 @@ class MainWindow(QWidget):
         lroi.addRow("Left", self.sb_left); lroi.addRow("Right", self.sb_right)
         form.addRow(QLabel("ROI exclude ratios"), row_roi)
 
+        # Filters
         self.sb_min_d = QDoubleSpinBox(); self.sb_min_d.setRange(0.0, 1000.0); self.sb_min_d.setDecimals(3); self.sb_min_d.setValue(0.01)
         self.sb_max_d = QDoubleSpinBox(); self.sb_max_d.setRange(0.0, 10000.0); self.sb_max_d.setDecimals(3); self.sb_max_d.setValue(10.0)
         self.sb_min_circ = QDoubleSpinBox(); self.sb_min_circ.setRange(0.0, 1.0); self.sb_min_circ.setDecimals(3); self.sb_min_circ.setValue(0.10)
         form.addRow("Min diameter (µm)", self.sb_min_d); form.addRow("Max diameter (µm)", self.sb_max_d); form.addRow("Min circularity", self.sb_min_circ)
 
+        # Morphology
         self.sb_closing = QDoubleSpinBox(); self.sb_closing.setRange(0.0, 100.0); self.sb_closing.setDecimals(3); self.sb_closing.setValue(0.12)
         self.sb_open = QDoubleSpinBox(); self.sb_open.setRange(0.0, 100.0); self.sb_open.setDecimals(3); self.sb_open.setValue(0.08)
         form.addRow("Closing (µm)", self.sb_closing); form.addRow("Opening (µm)", self.sb_open)
 
+        # Threshold
         self.cb_thr = QComboBox(); self.cb_thr.addItems(["otsu","adaptive"])
         self.sb_block = QSpinBox(); self.sb_block.setRange(3,999); self.sb_block.setValue(31)
         self.sb_C = QSpinBox(); self.sb_C.setRange(-255,255); self.sb_C.setValue(-10)
         form.addRow("Threshold", self.cb_thr); form.addRow("Adaptive block size", self.sb_block); form.addRow("Adaptive C", self.sb_C)
 
+        # Preprocess
         self.sb_clahe = QDoubleSpinBox(); self.sb_clahe.setRange(0.0,10.0); self.sb_clahe.setDecimals(2); self.sb_clahe.setValue(2.0)
         self.sb_tophat = QDoubleSpinBox(); self.sb_tophat.setRange(0.0,100.0); self.sb_tophat.setDecimals(3); self.sb_tophat.setValue(0.0)
         self.sb_level = QDoubleSpinBox(); self.sb_level.setRange(0.0,1.5); self.sb_level.setDecimals(2); self.sb_level.setValue(0.3)
@@ -377,73 +477,82 @@ class MainWindow(QWidget):
         form.addRow("CLAHE clip", self.sb_clahe); form.addRow("Top-hat radius (µm)", self.sb_tophat)
         form.addRow("Level strength", self.sb_level); form.addRow("Min rel. contrast", self.sb_min_rc)
 
+        # Watershed
         self.cb_split = QCheckBox("Split touching (watershed)"); self.cb_split.setChecked(False)
         self.sb_neck = QDoubleSpinBox(); self.sb_neck.setRange(0.0,10.0); self.sb_neck.setDecimals(3); self.sb_neck.setValue(0.12)
         self.sb_seg = QDoubleSpinBox(); self.sb_seg.setRange(0.0,100.0); self.sb_seg.setDecimals(3); self.sb_seg.setValue(0.20)
         form.addRow(self.cb_split); form.addRow("Min neck (µm)", self.sb_neck); form.addRow("Min segment d (µm)", self.sb_seg)
 
+        # Run / Export
         self.btn_run = QPushButton("Run analysis"); self.btn_run.clicked.connect(self.run_analysis); form.addRow(self.btn_run)
         self.btn_export_csv = QPushButton("Export CSV…"); self.btn_export_csv.clicked.connect(self.export_csv)
         self.btn_save_overlay = QPushButton("Save overlay…"); self.btn_save_overlay.clicked.connect(self.save_overlay)
         form.addRow(self.btn_export_csv); form.addRow(self.btn_save_overlay)
 
+        # Exclusions
         self.btn_toggle_remove = QPushButton("Remove blobs (click)"); self.btn_toggle_remove.setCheckable(True)
         self.btn_toggle_remove.setToolTip("Click a green contour to exclude / click again to restore")
         self.btn_toggle_remove.toggled.connect(self.on_toggle_remove)
         self.btn_clear_excl = QPushButton("Clear exclusions"); self.btn_clear_excl.clicked.connect(self.on_clear_exclusions)
         form.addRow(self.btn_toggle_remove); form.addRow(self.btn_clear_excl)
 
-        right = QWidget(); right_layout = QVBoxLayout(right)
+        # Right panel (views + stats)
+        right = QWidget(); right_layout = QVBoxLayout(right); right_layout.setContentsMargins(0,0,0,0)
+
         self.tabs = QTabWidget()
-        self.lbl_original = QLabel("No image"); self.lbl_original.setAlignment(Qt.AlignCenter); self.tabs.addTab(self.lbl_original, "Original")
-        self.lbl_leveled = QLabel(); self.lbl_leveled.setAlignment(Qt.AlignCenter); self.tabs.addTab(self.lbl_leveled, "Leveled")
-        self.lbl_threshold = QLabel(); self.lbl_threshold.setAlignment(Qt.AlignCenter); self.tabs.addTab(self.lbl_threshold, "Threshold")
-        self.lbl_overlay = QLabel(); self.lbl_overlay.setAlignment(Qt.AlignCenter); self.tabs.addTab(self.lbl_overlay, "Overlay")
-        self.lbl_overlay.mousePressEvent = self.on_overlay_click
+        self.tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        self.view_original = ImageView();  self.tabs.addTab(self.view_original, "Original")
+        self.view_leveled  = ImageView();  self.tabs.addTab(self.view_leveled,  "Leveled")
+        self.view_thresh   = ImageView();  self.tabs.addTab(self.view_thresh,   "Threshold")
+        self.view_overlay  = ImageView();  self.tabs.addTab(self.view_overlay,  "Overlay")
+        self.view_overlay.sig_clicked.connect(self.on_overlay_clicked)
 
         self.plot_hist = MplWidget(); self.tabs.addTab(self.plot_hist, "Histogram")
-        self.plot_cum = MplWidget(); self.tabs.addTab(self.plot_cum, "Cumulative")
-        right_layout.addWidget(self.tabs)
+        self.plot_cum  = MplWidget(); self.tabs.addTab(self.plot_cum,  "Cumulative")
+
+        right_layout.addWidget(self.tabs, 1)  # stretch=1 — займе весь простір
 
         self.stats_label = QLabel("—")
         self.table = QTableWidget(0,1); self.table.setHorizontalHeaderLabels(["diameter (µm)"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.setMinimumHeight(150)
-        right_layout.addWidget(self.stats_label); right_layout.addWidget(self.table)
+        right_layout.addWidget(self.stats_label, 0)
+        right_layout.addWidget(self.table, 0)
 
+        # Splitter
         splitter = QSplitter(); splitter.addWidget(left); splitter.addWidget(right)
         splitter.setStretchFactor(0,0); splitter.setStretchFactor(1,1)
+        splitter.setChildrenCollapsible(False)
 
-        root = QVBoxLayout(self); root.addLayout(topbar); root.addWidget(splitter)
+        # Root
+        root = QVBoxLayout(self)
+        root.addLayout(topbar)
+        root.addWidget(splitter, 1)  # stretch=1 — без «шапки»
+
         self.add_actions()
 
     def add_actions(self):
         act_open = QAction(self); act_open.setShortcut("Ctrl+O"); act_open.triggered.connect(self.open_image); self.addAction(act_open)
-        act_run = QAction(self); act_run.setShortcut("Ctrl+R"); act_run.triggered.connect(self.run_analysis); self.addAction(act_run)
+        act_run  = QAction(self); act_run.setShortcut("Ctrl+R"); act_run.triggered.connect(self.run_analysis); self.addAction(act_run)
 
-    # ---------- Helpers ----------
-
-    def _set_label_pixmap(self, label: QLabel, img: np.ndarray):
-        """Safely set pixmap; scale if label has size, else set raw."""
-        pm = np_to_qpix(img)
-        if label.width() > 5 and label.height() > 5:
-            pm = pm.scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        label.setPixmap(pm)
-
-    # ---------- Events ----------
+    # ---------- Events / helpers ----------
 
     def open_image(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open SEM image", "", "Images (*.tif *.tiff *.png *.jpg *.jpeg *.bmp)")
         if not path: return
         self.image_path = Path(path)
-        try: self.gray = imread_gray(path)
+        try:
+            self.gray = imread_gray(path)
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to read image:\n{e}"); return
+            QMessageBox.critical(self, "Error", f"Failed to read image:\n{e}")
+            return
         self.um_per_px_from_meta = scale_from_metadata(path)
         txt = f"Scale: from meta {self.um_per_px_from_meta:.6f} µm/px" if self.um_per_px_from_meta else "Scale: — (set µm/px or read metadata)"
         self.meta_label.setText(txt)
-        self._set_label_pixmap(self.lbl_original, cv2.cvtColor(self.gray, cv2.COLOR_GRAY2BGR))
-        self.tabs.setCurrentIndex(0)
+
+        self.view_original.set_image(cv2.cvtColor(self.gray, cv2.COLOR_GRAY2BGR))
+        self.tabs.setCurrentWidget(self.view_original)
 
     def read_scale_meta(self):
         if not self.image_path:
@@ -484,55 +593,36 @@ class MainWindow(QWidget):
             kB = count_reasonable_components(bwB, P.scale_um_per_px, P.min_d_um, P.max_d_um)
             kD = count_reasonable_components(bwD, P.scale_um_per_px, P.min_d_um, P.max_d_um)
             bw = bwB if kB >= kD else bwD
-            self.thr_raw = bw.copy()  # save raw threshold
+            self.thr_raw = bw.copy()
 
             bw_m = morph_close(bw, P.closing_um, P.scale_um_per_px)
             bw_m = morph_open(bw_m, P.open_um, P.scale_um_per_px)
             bw_m = fill_small_holes(bw_m, 0.6)
             if P.split_touching:
                 bw_m = split_touching_watershed(bw_m, P.scale_um_per_px, P.min_neck_um, P.min_seg_d_um)
-            self.thr_proc = bw_m  # save processed threshold
+            self.thr_proc = bw_m
 
-            results = measure_components(bw_m, P.min_d_um, P.max_d_um, P.min_circ, P.scale_um_per_px, self.lev, P.min_rel_contrast)
-            self.results = results; self.excluded_idx.clear()
+            self.results = measure_components(bw_m, P.min_d_um, P.max_d_um, P.min_circ, P.scale_um_per_px, self.lev, P.min_rel_contrast)
+            self.excluded_idx.clear()
             self._rebuild_overlay_and_stats()
             self.render_previews(); self.update_stats_table()
-            self.tabs.setCurrentWidget(self.lbl_overlay)
+            self.tabs.setCurrentWidget(self.view_overlay)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Processing failed:\n{e}")
 
-    # ---------- Exclusion / Overlay ----------
+    # ---------- Exclusions ----------
 
     def on_toggle_remove(self, on: bool):
         self.remove_mode = on
-        if on: self.tabs.setCurrentWidget(self.lbl_overlay)
+        if on: self.tabs.setCurrentWidget(self.view_overlay)
 
     def on_clear_exclusions(self):
         self.excluded_idx.clear()
         self._rebuild_overlay_and_stats(); self.render_previews(); self.update_stats_table()
 
-    def _label_to_image_xy(self, label: QLabel, ev_pos) -> tuple[int, int] | None:
-        if self.overlay is None: return None
-        img_h, img_w = self.overlay.shape[:2]
-        pm = label.pixmap()
-        if pm is None or pm.isNull(): return None
-        disp_w, disp_h = label.width(), label.height()
-        pm_w, pm_h = pm.width(), pm.height()
-        off_x, off_y = (disp_w - pm_w) // 2, (disp_h - pm_h) // 2
-        x, y = ev_pos.x() - off_x, ev_pos.y() - off_y
-        if x < 0 or y < 0 or x >= pm_w or y >= pm_h: return None
-        sx, sy = img_w / pm_w, img_h / pm_h
-        ix, iy = int(x * sx), int(y * sy)
-        ix = max(0, min(img_w - 1, ix)); iy = max(0, min(img_h - 1, iy))
-        return ix, iy
-
-    def on_overlay_click(self, ev):
-        if not self.remove_mode or self.overlay is None or not self.results: return
-        try: pos = ev.position().toPoint()
-        except AttributeError: pos = ev.pos()
-        pt = self._label_to_image_xy(self.lbl_overlay, pos)
-        if pt is None: return
-        x, y = pt
+    def on_overlay_clicked(self, x: int, y: int):
+        if not self.remove_mode or self.overlay_img is None or not self.results:
+            return
         hit = None
         for i, (cnt, _, _) in enumerate(self.results):
             if cv2.pointPolygonTest(cnt, (float(x), float(y)), measureDist=False) >= 0:
@@ -550,7 +640,7 @@ class MainWindow(QWidget):
             color = (0,0,255) if i in self.excluded_idx else (0,255,0)
             cv2.drawContours(over, [cnt], -1, color, 2)
             if i not in self.excluded_idx: active_diams.append(d_um)
-        self.overlay = over
+        self.overlay_img = over
         self.diams_um = np.array(active_diams, float)
         self.stats = stats_from_diams(self.diams_um)
 
@@ -558,15 +648,14 @@ class MainWindow(QWidget):
 
     def render_previews(self):
         if self.gray is not None:
-            self._set_label_pixmap(self.lbl_original, cv2.cvtColor(self.gray, cv2.COLOR_GRAY2BGR))
+            self.view_original.set_image(cv2.cvtColor(self.gray, cv2.COLOR_GRAY2BGR))
         if self.lev is not None:
-            self._set_label_pixmap(self.lbl_leveled, cv2.cvtColor(self.lev, cv2.COLOR_GRAY2BGR))
-        # Prefer processed threshold; fall back to raw if needed
+            self.view_leveled.set_image(cv2.cvtColor(self.lev, cv2.COLOR_GRAY2BGR))
         thr_to_show = self.thr_proc if self.thr_proc is not None else self.thr_raw
         if thr_to_show is not None:
-            self._set_label_pixmap(self.lbl_threshold, thr_to_show)
-        if self.overlay is not None:
-            self._set_label_pixmap(self.lbl_overlay, self.overlay)
+            self.view_thresh.set_image(thr_to_show)
+        if self.overlay_img is not None:
+            self.view_overlay.set_image(self.overlay_img)
         self.plot_hist.plot_hist(self.diams_um, self.stats, "PSD Histogram")
         self.plot_cum.plot_cum(self.diams_um, self.stats)
 
@@ -608,18 +697,23 @@ class MainWindow(QWidget):
             QMessageBox.critical(self, "CSV", f"Failed to save: {e}")
 
     def save_overlay(self):
-        if self.overlay is None:
+        if self.overlay_img is None:
             QMessageBox.information(self, "Overlay", "Run analysis first."); return
         path, _ = QFileDialog.getSaveFileName(self, "Save overlay image", "overlay.png", "PNG (*.png);;JPEG (*.jpg *.jpeg)")
         if not path: return
         try:
-            bgr = cv2.cvtColor(self.overlay, cv2.COLOR_RGB2BGR) if self.overlay.shape[2] == 3 else self.overlay
+            bgr = cv2.cvtColor(self.overlay_img, cv2.COLOR_RGB2BGR) if self.overlay_img.shape[2] == 3 else self.overlay_img
             cv2.imwrite(path, bgr)
         except Exception as e:
             QMessageBox.critical(self, "Overlay", f"Failed to save: {e}")
 
+
 def main():
-    app = QApplication(sys.argv); w = MainWindow(); w.show(); sys.exit(app.exec())
+    app = QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()
