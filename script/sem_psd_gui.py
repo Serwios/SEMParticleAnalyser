@@ -1,43 +1,28 @@
 # sem_psd_gui.py
 # SEM particle-size GUI (PySide6)
-# Modes:
-#  - Contours (threshold)
-#  - Nano (LoG)   [scale-normalized Laplacian of Gaussian blob detection]
-#
-# UX:
-#  - English labels & tooltips
-#  - Tooltips show after 5s
-#  - Help dialog
-#  - Auto-tune button
-#  - Background processing with progress bar
-#  - Click-to-exclude blobs on Overlay
 
 from __future__ import annotations
 import sys, math, re, csv, textwrap
 from pathlib import Path
 from dataclasses import dataclass
+
 import numpy as np
 import cv2
 from PIL import Image
 
 from PySide6.QtCore import Qt, Signal, QObject, QThread
-from PySide6.QtGui import QPixmap, QAction, QTransform, QPainter, QImage
+from PySide6.QtGui import QPixmap, QAction, QTransform, QPainter, QImage, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QWidget, QFileDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QFormLayout, QDoubleSpinBox, QSpinBox, QTabWidget, QComboBox, QCheckBox,
     QMessageBox, QSplitter, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy,
-    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QProgressBar, QGroupBox, QToolTip
+    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QProgressBar, QGroupBox,
+    QProxyStyle, QStyle, QToolButton, QMenu, QStackedWidget
 )
-from PySide6.QtWidgets import QProxyStyle, QStyle
-
-
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PySide6.QtWidgets import QToolButton, QMenu
 
-# -------------------------------------------------------------------
-# Utilities (image IO, preprocessing, threshold, morphology, LoG, etc.)
-# -------------------------------------------------------------------
+# ---------------- Utilities ----------------
 
 def imread_gray(path: str) -> np.ndarray:
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
@@ -151,7 +136,7 @@ def fill_small_holes(mask: np.ndarray, max_frac: float) -> np.ndarray:
     if hier is None: return filled
     hier = hier[0]
     for i, (cnt, h) in enumerate(zip(contours, hier)):
-        if h[3] != -1: continue  # only outer
+        if h[3] != -1: continue
         area = cv2.contourArea(cnt); child = h[2]
         while child != -1:
             hole_cnt = contours[child]; hole_area = cv2.contourArea(hole_cnt)
@@ -269,7 +254,7 @@ def np_to_qpix(img: np.ndarray) -> QPixmap:
     qim = QImage(qimg.data, w, h, 3 * w, QImage.Format_RGB888)
     return QPixmap.fromImage(qim)
 
-# ---------------- LoG functions ----------------
+# ---------------- LoG helpers ----------------
 
 def sigma_from_d_um(d_um: float, um_per_px: float) -> float:
     return max(0.6, (d_um / (2.0 * math.sqrt(2.0))) / um_per_px)
@@ -353,7 +338,7 @@ def detect_blobs_log(gray: np.ndarray, lev_img: np.ndarray, um_per_px: float,
 # ---------------- Helper widgets ----------------
 
 class ImageView(QGraphicsView):
-    sig_clicked = Signal(int, int)  # image coords
+    sig_clicked = Signal(int, int)
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setScene(QGraphicsScene(self))
@@ -381,9 +366,9 @@ class ImageView(QGraphicsView):
     def fit_to_view(self):
         if self._img_w == 0 or self.width() < 5 or self.height() < 5:
             return
-        self.setTransform(QTransform())  # reset zoom
+        self.setTransform(QTransform())
         r = self._item.boundingRect()
-        m = 2  # small margin px
+        m = 2
         self.fitInView(r.adjusted(m, m, -m, -m), Qt.KeepAspectRatio)
 
     def resizeEvent(self, e):
@@ -407,7 +392,7 @@ class ImageView(QGraphicsView):
         if e.modifiers() & Qt.ControlModifier:
             if e.key() == Qt.Key_1:
                 self._auto_fit = False
-                self.setTransform(QTransform())  # 100%
+                self.setTransform(QTransform())
                 e.accept(); return
             if e.key() == Qt.Key_0:
                 self._auto_fit = True
@@ -431,12 +416,10 @@ class ImageView(QGraphicsView):
 
 class ToolTipDelayStyle(QProxyStyle):
     def styleHint(self, hint, option=None, widget=None, returnData=None):
-        # Затримка перед показом тултіпу (мс)
         if hint == QStyle.SH_ToolTip_WakeUpDelay:
-            return 5000  # 5 секунд
-        # Необов’язково: як довго тултіп може висіти (мс)
+            return 5000
         if hint == QStyle.SH_ToolTip_FallAsleepDelay:
-            return 30000  # 30 секунд
+            return 30000
         return super().styleHint(hint, option, widget, returnData)
 
 class MplWidget(QWidget):
@@ -444,9 +427,7 @@ class MplWidget(QWidget):
         super().__init__(parent)
         self.fig = Figure(figsize=(5, 4))
         self.canvas = FigureCanvas(self.fig)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.canvas)
+        layout = QVBoxLayout(self); layout.setContentsMargins(0, 0, 0, 0); layout.addWidget(self.canvas)
 
     def plot_hist(self, d_um: np.ndarray, st: dict, title: str):
         self.fig.clear(); ax = self.fig.add_subplot(111)
@@ -469,7 +450,7 @@ class MplWidget(QWidget):
             ax.grid(True); ax.legend()
         self.canvas.draw()
 
-# ---------------- Parameters dataclass ----------------
+# ---------------- Parameters ----------------
 
 @dataclass
 class Params:
@@ -481,11 +462,11 @@ class Params:
     thr_method: str; block_size: int; block_C: int
     clahe_clip: float; min_rel_contrast: float; tophat_um: float; level_strength: float
     split_touching: bool; min_neck_um: float; min_seg_d_um: float
-    analysis_mode: str           # "contours" | "log"
-    log_threshold_rel: float     # 0..1
-    log_minsep_um: float         # µm
+    analysis_mode: str
+    log_threshold_rel: float
+    log_minsep_um: float
 
-# ---------------- Worker for background processing ----------------
+# ---------------- Worker ----------------
 
 class Worker(QObject):
     finished = Signal(object)
@@ -505,7 +486,6 @@ class Worker(QObject):
                                            roi_mask, self.P.min_rel_contrast)
                 self.finished.emit({"lev": lev, "thr_raw": None, "thr_proc": None, "results": results}); return
 
-            # contour pipeline
             bwB, bwD = threshold_pair(lev, roi_mask, method=self.P.thr_method, block_size=self.P.block_size, C=self.P.block_C)
             kB = count_reasonable_components(bwB, self.P.scale_um_per_px, self.P.min_d_um, self.P.max_d_um)
             kD = count_reasonable_components(bwD, self.P.scale_um_per_px, self.P.min_d_um, self.P.max_d_um)
@@ -513,7 +493,8 @@ class Worker(QObject):
             bw = morph_close(bw, self.P.closing_um, self.P.scale_um_per_px)
             bw = morph_open(bw, self.P.open_um, self.P.scale_um_per_px)
             bw = fill_small_holes(bw, 0.6)
-            if self.P.split_touching: bw = split_touching_watershed(bw, self.P.scale_um_per_px, self.P.min_neck_um, self.P.min_seg_d_um)
+            if self.P.split_touching:
+                bw = split_touching_watershed(bw, self.P.scale_um_per_px, self.P.min_neck_um, self.P.min_seg_d_um)
             results = measure_components(bw, self.P.min_d_um, self.P.max_d_um, self.P.min_circ, self.P.scale_um_per_px, lev, self.P.min_rel_contrast)
             self.finished.emit({"lev": lev, "thr_raw": thr_raw, "thr_proc": bw, "results": results})
         except Exception as e:
@@ -524,10 +505,10 @@ class Worker(QObject):
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SEM PSD (Blob Analysis)")
+        self.setWindowTitle("SEM PSD (Particles Analysis)")
         self.resize(1400, 900)
 
-        # State vars, thread/worker
+        # State
         self.image_path: Path | None = None
         self.gray: np.ndarray | None = None
         self.overlay_img: np.ndarray | None = None
@@ -542,32 +523,34 @@ class MainWindow(QWidget):
         self.remove_mode: bool = False
         self._thread: QThread | None = None
         self._worker: Worker | None = None
+        self._open_in_progress: bool = False
 
         self.build_ui()
 
+    # ---------- UI ----------
     def build_ui(self):
         topbar = QHBoxLayout()
+
         self.btn_open = QToolButton()
         self.btn_open.setText("Open image…")
         self.btn_open.setToolTip("Open a SEM image file or a built-in sample.")
         self.btn_open.setPopupMode(QToolButton.MenuButtonPopup)
-        self.btn_open.clicked.connect(self.open_image)  # лівий клік → звичний open
+        self.btn_open.clicked.connect(self.open_image)
 
-        m = QMenu(self)
-        act_open = m.addAction("Open…")
+        menu = QMenu(self)
+        act_open = menu.addAction("Open…")
         act_open.triggered.connect(self.open_image)
-
-        smpl = m.addMenu("Open test sample")
+        smpl = menu.addMenu("Open test sample")
         smpl.addAction("blobs.tif", lambda: self.open_sample("blobs.tif"))
         smpl.addAction("granular.tif", lambda: self.open_sample("granular.tif"))
-
-        self.btn_open.setMenu(m)
+        self.btn_open.setMenu(menu)
 
         self.meta_label = QLabel("Scale: —"); self.meta_label.setStyleSheet("color:#666")
         self.progress = QProgressBar(); self.progress.setRange(0,0); self.progress.setVisible(False); self.progress.setFixedHeight(8); self.progress.setTextVisible(False)
+
         topbar.addWidget(self.btn_open); topbar.addWidget(self.meta_label); topbar.addStretch(1); topbar.addWidget(self.progress)
 
-        # Left panel with controls
+        # Left panel (controls)
         left = QWidget(); form = QFormLayout(left)
 
         self.sb_scale = QDoubleSpinBox(); self.sb_scale.setRange(1e-6, 1000.0); self.sb_scale.setDecimals(6); self.sb_scale.setValue(0.0)
@@ -633,10 +616,8 @@ class MainWindow(QWidget):
             ("Min segment d (µm)", self.sb_seg),
         ]
         for label, widget in rows_thr:
-            if label is None:
-                lay_thr.addRow(widget)
-            else:
-                lay_thr.addRow(label, widget)
+            if label is None: lay_thr.addRow(widget)
+            else: lay_thr.addRow(label, widget)
         form.addRow(self.grp_thr)
 
         # LoG-only
@@ -656,10 +637,9 @@ class MainWindow(QWidget):
         self.btn_clear_excl = QPushButton("Clear exclusions"); self.btn_clear_excl.setToolTip("Remove all manual exclusions."); self.btn_clear_excl.clicked.connect(self.on_clear_exclusions)
         form.addRow(self.btn_autotune); form.addRow(self.btn_run); form.addRow(self.btn_export_csv); form.addRow(self.btn_save_overlay); form.addRow(self.btn_toggle_remove); form.addRow(self.btn_clear_excl)
 
-        # Right panel with views + stats
+        # -------- Right workspace --------
         right = QWidget(); right_layout = QVBoxLayout(right); right_layout.setContentsMargins(0,0,0,0)
-        self.tabs = QTabWidget()
-        self.tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.tabs = QTabWidget(); self.tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self.view_original = ImageView();  self.tabs.addTab(self.view_original, "Original")
         self.view_leveled  = ImageView();  self.tabs.addTab(self.view_leveled,  "Leveled")
@@ -669,37 +649,66 @@ class MainWindow(QWidget):
 
         self.plot_hist = MplWidget(); self.tabs.addTab(self.plot_hist, "Histogram")
         self.plot_cum  = MplWidget(); self.tabs.addTab(self.plot_cum,  "Cumulative")
-
         right_layout.addWidget(self.tabs, 1)
 
         self.stats_label = QLabel("—")
         self.table = QTableWidget(0,1); self.table.setHorizontalHeaderLabels(["diameter (µm)"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.setMinimumHeight(150)
-        right_layout.addWidget(self.stats_label, 0)
-        right_layout.addWidget(self.table, 0)
+        right_layout.addWidget(self.stats_label, 0); right_layout.addWidget(self.table, 0)
+
+        # -------- Welcome screen --------
+        welcome = QWidget(); wl = QVBoxLayout(welcome)
+        lbl = QLabel(
+            "<h2 style='margin:0'>SEM PSD (Particle Analysis)</h2>"
+            "<p>Open a SEM image (Ctrl+O) or load a test sample:</p>"
+            "<ul><li><b>Ctrl+1</b> — samples/blobs.tif</li>"
+            "<li><b>Ctrl+2</b> — samples/granular.tif</li></ul>"
+            "<p>Pick the analysis mode (Contours / Nano [LoG]) and press <br> <b>Run analysis</b> - <b>Ctrl+R</b><br></p>"
+        )
+        lbl.setWordWrap(True); lbl.setAlignment(Qt.AlignCenter)
+        wl.addStretch(1); wl.addWidget(lbl, alignment=Qt.AlignCenter); wl.addStretch(1)
+
+        # Stacked right area
+        self.right_stack = QStackedWidget(); self.right_stack.addWidget(welcome); self.right_stack.addWidget(right)
+        self.right_stack.setCurrentIndex(0)
 
         # Splitter
-        splitter = QSplitter(); splitter.addWidget(left); splitter.addWidget(right)
-        splitter.setStretchFactor(0,0); splitter.setStretchFactor(1,1)
-        splitter.setChildrenCollapsible(False)
+        splitter = QSplitter(); splitter.addWidget(left); splitter.addWidget(self.right_stack)
+        splitter.setStretchFactor(0,0); splitter.setStretchFactor(1,1); splitter.setChildrenCollapsible(False)
 
         # Root
-        root = QVBoxLayout(self)
-        root.addLayout(topbar)
-        root.addWidget(splitter, 1)
+        root = QVBoxLayout(self); root.addLayout(topbar); root.addWidget(splitter, 1)
 
         self.add_actions()
         self.update_param_visibility()
 
+    # ---------- Hotkeys ----------
     def add_actions(self):
-        self.addAction(QAction(self, shortcut="Ctrl+O", triggered=self.open_image, shortcutContext=Qt.ApplicationShortcut))
-        self.addAction(QAction(self, shortcut="Ctrl+R", triggered=self.run_analysis, shortcutContext=Qt.ApplicationShortcut))
-        self.addAction(QAction(self, shortcut="Ctrl+1", triggered=lambda: self.open_sample("blobs.tif"),shortcutContext=Qt.ApplicationShortcut))
-        self.addAction(QAction(self, shortcut="Ctrl+2", triggered=lambda: self.open_sample("granular.tif"),shortcutContext=Qt.ApplicationShortcut))
+        # ЄДИНИЙ шорткат відкриття — стандартний Open (Ctrl+O / Cmd+O), ApplicationShortcut
+        self.act_open_global = QAction(self)
+        self.act_open_global.setShortcut(QKeySequence(QKeySequence.Open))
+        self.act_open_global.setShortcutContext(Qt.ApplicationShortcut)
+        self.act_open_global.triggered.connect(self.open_image)
+        self.addAction(self.act_open_global)
+
+        # Інші хоткеї
+        self.act_run = QAction(self, triggered=self.run_analysis)
+        self.act_run.setShortcut(QKeySequence("Ctrl+R"))
+        self.act_run.setShortcutContext(Qt.ApplicationShortcut)
+        self.addAction(self.act_run)
+
+        self.act_sample1 = QAction(self, triggered=lambda: self.open_sample("blobs.tif"))
+        self.act_sample1.setShortcut(QKeySequence("Ctrl+1"))
+        self.act_sample1.setShortcutContext(Qt.ApplicationShortcut)
+        self.addAction(self.act_sample1)
+
+        self.act_sample2 = QAction(self, triggered=lambda: self.open_sample("granular.tif"))
+        self.act_sample2.setShortcut(QKeySequence("Ctrl+2"))
+        self.act_sample2.setShortcutContext(Qt.ApplicationShortcut)
+        self.addAction(self.act_sample2)
 
     # ---------- Help ----------
-
     def show_help(self):
         txt = textwrap.dedent("""
         ### Modes
@@ -723,50 +732,51 @@ class MainWindow(QWidget):
         QMessageBox.information(self, "Help", txt)
 
     # ---------- Visibility ----------
-
     def update_param_visibility(self):
         is_log = (self.cb_mode.currentIndex() == 1)
         self.grp_log.setVisible(is_log)
         self.grp_thr.setVisible(not is_log)
         self.tabs.setTabEnabled(self.tabs.indexOf(self.view_thresh), not is_log)
 
-    # ---------- Events / helpers ----------
-
-    def open_image(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open SEM image", "", "Images (*.tif *.tiff *.png *.jpg *.jpeg *.bmp)")
-        if not path: return
-        self.image_path = Path(path)
-        try:
-            self.gray = imread_gray(path)
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to read image:\n{e}")
-            return
-        self.um_per_px_from_meta = scale_from_metadata(path)
-        txt = f"Scale: from meta {self.um_per_px_from_meta:.6f} µm/px" if self.um_per_px_from_meta else "Scale: — (set µm/px or read metadata)"
-        self.meta_label.setText(txt)
-
-        self.view_original.set_image(cv2.cvtColor(self.gray, cv2.COLOR_GRAY2BGR))
-        self.tabs.setCurrentWidget(self.view_original)
-
-    def open_sample(self, filename: str):
-        # samples/ поряд із коренем проекту (SEMParticleAnalyser/samples)
-        script_dir = Path(__file__).resolve().parent
-        samples_dir = script_dir.parent / "samples"
-        p = samples_dir / filename
-        if not p.exists():
-            QMessageBox.warning(self, "Sample not found", f"File not found:\n{p}")
-            return
+    # ---------- File open helpers ----------
+    def _open_path(self, p: Path):
         self.image_path = p
         try:
             self.gray = imread_gray(str(p))
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to read sample:\n{e}")
+            QMessageBox.critical(self, "Error", f"Failed to read image:\n{e}")
             return
         self.um_per_px_from_meta = scale_from_metadata(str(p))
-        txt = f"Scale: from meta {self.um_per_px_from_meta:.6f} µm/px" if self.um_per_px_from_meta else "Scale: — (set µm/px or read metadata)"
-        self.meta_label.setText(txt)
+        if self.um_per_px_from_meta:
+            self.sb_scale.setValue(round(self.um_per_px_from_meta, 6))
+            self.meta_label.setText(f"Scale: from meta {self.um_per_px_from_meta:.6f} µm/px (also set in control)")
+        else:
+            self.meta_label.setText("Scale: — (set µm/px or read metadata)")
         self.view_original.set_image(cv2.cvtColor(self.gray, cv2.COLOR_GRAY2BGR))
         self.tabs.setCurrentWidget(self.view_original)
+        self._show_tabs(True)
+
+    def open_image(self):
+        if self._open_in_progress:
+            return
+        self._open_in_progress = True
+        try:
+            path, _ = QFileDialog.getOpenFileName(self, "Open SEM image", "", "Images (*.tif *.tiff *.png *.jpg *.jpeg *.bmp)")
+            if not path: return
+            self._open_path(Path(path))
+        finally:
+            self._open_in_progress = False
+
+    def _show_tabs(self, on: bool):
+        self.right_stack.setCurrentIndex(1 if on else 0)
+
+    def open_sample(self, filename: str):
+        samples_dir = Path(__file__).resolve().parent.parent / "samples"
+        p = samples_dir / filename
+        if not p.exists():
+            QMessageBox.warning(self, "Sample not found", f"File not found:\n{p}")
+            return
+        self._open_path(p)
 
     def read_scale_meta(self):
         if not self.image_path:
@@ -810,69 +820,39 @@ class MainWindow(QWidget):
         if self.gray is None:
             QMessageBox.information(self, "Auto-tune", "Open an image first.")
             return
-
         P = self.current_params()
 
-        # ---- 0) Scale sanity + try metadata fallback ----
         def bad_scale(v: float | None) -> bool:
             return (v is None) or (v <= 0) or (v < 1e-4) or (v > 1e3)
-
         if bad_scale(P.scale_um_per_px):
             meta_val = scale_from_metadata(str(self.image_path)) if self.image_path else None
             if not bad_scale(meta_val):
                 self.sb_scale.setValue(round(meta_val, 6))
                 P.scale_um_per_px = meta_val
-                QMessageBox.information(
-                    self, "Auto-tune",
-                    f"Scale was invalid. Using scale from metadata: {meta_val:.6f} µm/px"
-                )
+                QMessageBox.information(self, "Auto-tune", f"Scale was invalid. Using scale from metadata: {meta_val:.6f} µm/px")
             else:
-                QMessageBox.warning(
-                    self, "Auto-tune",
-                    "Scale (µm/px) is invalid and no usable value found in metadata.\n"
-                    "Please set a proper scale manually."
-                )
+                QMessageBox.warning(self, "Auto-tune", "Scale (µm/px) is invalid and no usable value found in metadata.\nPlease set a proper scale manually.")
                 return
 
-        # ---- 1) Fast LoG scan in a compact scale range ----
         roi_mask = make_roi_mask(self.gray.shape, P.exclude_top, P.exclude_bottom, P.exclude_left, P.exclude_right)
-        lev = preprocess(
-            self.gray,
-            clahe_clip=max(1.5, P.clahe_clip or 0),
-            tophat_um=max(0.0, P.tophat_um),
-            um_per_px=P.scale_um_per_px,
-            level_strength=max(0.2, P.level_strength),
-        )
+        lev = preprocess(self.gray, clahe_clip=max(1.5, P.clahe_clip or 0), tophat_um=max(0.0, P.tophat_um),
+                         um_per_px=P.scale_um_per_px, level_strength=max(0.2, P.level_strength))
 
-        # LoG scales: diameters ~ [0.01 .. min(2.0, max_d or 1.0)] µm
         d_lo, d_hi = 0.01, min(2.0, max(1.0, (P.max_d_um or 1.0)))
-        sigmas = np.exp(
-            np.linspace(
-                np.log(sigma_from_d_um(d_lo, P.scale_um_per_px)),
-                np.log(sigma_from_d_um(d_hi, P.scale_um_per_px)),
-                9
-            )
-        )
-
+        sigmas = np.exp(np.linspace(np.log(sigma_from_d_um(d_lo, P.scale_um_per_px)),
+                                    np.log(sigma_from_d_um(d_hi, P.scale_um_per_px)), 9))
         img = self.gray.astype(np.float32)
         H, W = self.gray.shape
         resp_max = np.zeros((H, W), np.float32)
         arg_sigma = np.zeros((H, W), np.float32)
-
         for s in sigmas:
-            R = log_response(img, float(s))
-            R = cv2.bitwise_and(R, R, mask=roi_mask)
-            better = R > resp_max
-            resp_max[better] = R[better]
-            arg_sigma[better] = float(s)
+            R = log_response(img, float(s)); R = cv2.bitwise_and(R, R, mask=roi_mask)
+            better = R > resp_max; resp_max[better] = R[better]; arg_sigma[better] = float(s)
 
         mx = float(resp_max.max()) if resp_max.size else 0.0
         if mx <= 0:
-            QMessageBox.warning(self, "Auto-tune", "Could not estimate LoG response on this image.")
-            return
+            QMessageBox.warning(self, "Auto-tune", "Could not estimate LoG response on this image."); return
 
-        # ---- 2) Pick a relative threshold giving a reasonable number of peaks ----
-        # slightly wider acceptance range to be robust
         candidates = [0.015, 0.020, 0.025, 0.030, 0.035, 0.040, 0.050]
         chosen_thr, chosen_count = candidates[3], 0
         nms = nms2d(resp_max, 1)
@@ -880,73 +860,42 @@ class MainWindow(QWidget):
             m = (resp_max >= (t * mx)) & nms
             n = int(np.count_nonzero(m))
             chosen_thr, chosen_count = t, n
-            if 300 <= n <= 8000:
-                break
+            if 300 <= n <= 8000: break
 
         mask = (resp_max >= (chosen_thr * mx)) & nms
         sig_est = arg_sigma[mask]
         if sig_est.size == 0:
-            QMessageBox.information(self, "Auto-tune", "No reliable peaks for auto-tune. Try manual.")
-            return
+            QMessageBox.information(self, "Auto-tune", "No reliable peaks for auto-tune. Try manual."); return
 
-        # ---- 3) Robust size estimates (less sensitive to agglomerates) ----
         p20 = float(np.percentile(sig_est, 20))
         p50 = float(np.percentile(sig_est, 50))
         p80 = float(np.percentile(sig_est, 80))
 
         def sigma_to_um(s: float) -> float:
             return (2.0 * math.sqrt(2.0) * s) * P.scale_um_per_px
-
         d20_um, d50_um, d80_um = sigma_to_um(p20), sigma_to_um(p50), sigma_to_um(p80)
 
-        # ---- 4) Update params depending on mode + clamp to safe ranges ----
-        if self.cb_mode.currentIndex() == 1:  # LoG mode
-            # LoG threshold: keep within [0.02 .. 0.06]
+        if self.cb_mode.currentIndex() == 1:  # LoG
             self.sb_log_thr.setValue(float(min(0.06, max(0.02, chosen_thr))))
-
-            # Min/Max diameter (µm): use p20/p80 and clamp
-            min_d = max(0.01, 0.5 * d20_um)
-            max_d = max(min_d * 1.2, 1.6 * d80_um)
-            # hard clamps for nano
-            min_d = float(min(0.20, max(0.01, min_d)))
-            max_d = float(min(2.0, max(min_d + 0.02, max_d)))
-            self.sb_min_d.setValue(min_d)
-            self.sb_max_d.setValue(max_d)
-
-            # Min separation ~ 0.6 * d50, but keep in [0.05 .. 0.25] µm
-            min_sep = 0.6 * d50_um
-            self.sb_log_sep.setValue(float(min(0.25, max(0.05, min_sep))))
-
-            # Preprocess gentle defaults
-            if self.sb_clahe.value() == 0:
-                self.sb_clahe.setValue(2.0)
+            min_d = float(min(0.20, max(0.01, 0.5 * d20_um)))
+            max_d = float(min(2.0, max(min_d + 0.02, 1.6 * d80_um)))
+            self.sb_min_d.setValue(min_d); self.sb_max_d.setValue(max_d)
+            self.sb_log_sep.setValue(float(min(0.25, max(0.05, 0.6 * d50_um))))
+            if self.sb_clahe.value() == 0: self.sb_clahe.setValue(2.0)
             self.sb_tophat.setValue(float(min(0.08, max(0.02, 0.6 * d50_um))))
             self.sb_level.setValue(float(min(0.6, max(0.3, self.sb_level.value()))))
-
-        else:  # Contours (threshold) mode
-            # Size window around nano estimates, clamped
-            min_d = max(0.02, 0.6 * d20_um)
-            max_d = max(0.18, 1.8 * d80_um)
-            min_d = float(min(0.30, max(0.01, min_d)))
-            max_d = float(min(1.5, max(min_d + 0.02, max_d)))
-            self.sb_min_d.setValue(min_d)
-            self.sb_max_d.setValue(max_d)
-
-            # Threshold method + morphology scaled from d50
+        else:  # Threshold
+            min_d = float(min(0.30, max(0.01, 0.6 * d20_um)))
+            max_d = float(min(1.5, max(min_d + 0.02, 1.8 * d80_um)))
+            self.sb_min_d.setValue(min_d); self.sb_max_d.setValue(max_d)
             self.cb_thr.setCurrentText("otsu")
             self.sb_open.setValue(float(min(0.40, max(0.04, 0.30 * d50_um))))
             self.sb_closing.setValue(float(min(0.50, max(0.06, 0.40 * d50_um))))
-
-            # Watershed if small d50
-            split = d50_um < 0.40
-            self.cb_split.setChecked(split)
+            split = d50_um < 0.40; self.cb_split.setChecked(split)
             self.sb_neck.setValue(float(min(0.40, max(0.08, 0.30 * d50_um))))
             self.sb_seg.setValue(float(min(0.60, max(0.16, 0.70 * d50_um))))
-
-            # General preprocessing
             self.sb_min_circ.setValue(0.10)
-            if self.sb_clahe.value() < 1.5:
-                self.sb_clahe.setValue(2.0)
+            if self.sb_clahe.value() < 1.5: self.sb_clahe.setValue(2.0)
             self.sb_level.setValue(float(max(0.25, self.sb_level.value())))
 
         QMessageBox.information(
@@ -957,7 +906,6 @@ class MainWindow(QWidget):
         )
 
     # ---------- Run ----------
-
     def run_analysis(self):
         if self.gray is None or self.image_path is None:
             QMessageBox.information(self, "Info", "Open an image first."); return
@@ -987,7 +935,6 @@ class MainWindow(QWidget):
         QMessageBox.critical(self, "Error", f"Processing failed:\n{msg}")
 
     # ---------- Exclusions ----------
-
     def on_toggle_remove(self, on: bool):
         self.remove_mode = on
         if on: self.tabs.setCurrentWidget(self.view_overlay)
@@ -997,8 +944,7 @@ class MainWindow(QWidget):
         self._rebuild_overlay_and_stats(); self.render_previews(); self.update_stats_table()
 
     def on_overlay_clicked(self, x: int, y: int):
-        if not self.remove_mode or self.overlay_img is None or not self.results:
-            return
+        if not self.remove_mode or self.overlay_img is None or not self.results: return
         hit = None
         for i, (cnt, _, _) in enumerate(self.results):
             if cv2.pointPolygonTest(cnt, (float(x), float(y)), measureDist=False) >= 0:
@@ -1021,7 +967,6 @@ class MainWindow(QWidget):
         self.stats = stats_from_diams(self.diams_um)
 
     # ---------- Rendering / Table / Export ----------
-
     def render_previews(self):
         if self.gray is not None:
             self.view_original.set_image(cv2.cvtColor(self.gray, cv2.COLOR_GRAY2BGR))
@@ -1078,8 +1023,7 @@ class MainWindow(QWidget):
         path, _ = QFileDialog.getSaveFileName(self, "Save overlay image", "overlay.png", "PNG (*.png);;JPEG (*.jpg *.jpeg)")
         if not path: return
         try:
-            bgr = cv2.cvtColor(self.overlay_img, cv2.COLOR_RGB2BGR) if self.overlay_img.shape[2] == 3 else self.overlay_img
-            cv2.imwrite(path, bgr)
+            cv2.imwrite(path, self.overlay_img)
         except Exception as e:
             QMessageBox.critical(self, "Overlay", f"Failed to save: {e}")
 
@@ -1089,7 +1033,6 @@ def main():
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
-
 
 if __name__ == "__main__":
     main()
