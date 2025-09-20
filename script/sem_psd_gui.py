@@ -22,6 +22,8 @@ from PySide6.QtWidgets import (
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
+from PySide6.QtCore import QStandardPaths
+
 # ---------------- Utilities ----------------
 
 def imread_gray(path: str) -> np.ndarray:
@@ -1019,13 +1021,61 @@ class MainWindow(QWidget):
 
     def save_overlay(self):
         if self.overlay_img is None:
-            QMessageBox.information(self, "Overlay", "Run analysis first."); return
-        path, _ = QFileDialog.getSaveFileName(self, "Save overlay image", "overlay.png", "PNG (*.png);;JPEG (*.jpg *.jpeg)")
-        if not path: return
+            QMessageBox.information(self, "Overlay", "Run analysis first.")
+            return
+
+        pics = QStandardPaths.writableLocation(QStandardPaths.PicturesLocation) or ""
+        default_path = str(Path(pics) / "overlay.png")
+
+        path, selected = QFileDialog.getSaveFileName(
+            self, "Save overlay image", default_path,
+            "PNG (*.png);;JPEG (*.jpg *.jpeg)"
+        )
+        if not path:
+            return
+
+        p = Path(path)
+
+        if p.suffix.lower() == "":
+            sel = (selected or "").lower()
+            if "png" in sel:
+                p = p.with_suffix(".png")
+            elif "jpg" in sel or "jpeg" in sel:
+                p = p.with_suffix(".jpg")
+            else:
+                p = p.with_suffix(".png")
+
         try:
-            cv2.imwrite(path, self.overlay_img)
+            p.parent.mkdir(parents=True, exist_ok=True)
         except Exception as e:
-            QMessageBox.critical(self, "Overlay", f"Failed to save: {e}")
+            QMessageBox.critical(self, "Overlay", f"Cannot create folder:\n{p.parent}\n{e}")
+            return
+
+        img = np.ascontiguousarray(self.overlay_img)
+
+        try:
+            h, w, _ = img.shape
+            qimg = QImage(img.data, w, h, 3 * w, QImage.Format_BGR888)
+            if qimg.save(str(p)):
+                QMessageBox.information(self, "Overlay", f"Saved:\n{p}")
+                return
+        except Exception:
+            pass
+
+        try:
+            ok = cv2.imwrite(str(p), img)
+            if ok:
+                QMessageBox.information(self, "Overlay", f"Saved:\n{p}")
+                return
+        except Exception as e:
+            QMessageBox.critical(self, "Overlay", f"Failed to save with OpenCV:\n{e}")
+            return
+
+        QMessageBox.critical(
+            self, "Overlay",
+            "Failed to save the overlay image.\n"
+            "Ensure the folder is writable and the filename has a valid extension (.png / .jpg)."
+        )
 
 def main():
     app = QApplication(sys.argv)
