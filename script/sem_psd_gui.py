@@ -1,6 +1,13 @@
 # sem_psd_gui.py
-# Desktop GUI (PySide6) for SEM particle-size analysis with click-to-exclude blobs.
-# Fullscreen-friendly image viewer (auto-fit), robust Threshold rendering.
+# Desktop GUI (PySide6) for SEM particle-size analysis
+# Modes:
+#  - Contours (threshold): контурний pipeline (добрий для плям)
+#  - Nano (LoG): багатомасштабний LoG для наночастинок та агломератів
+#
+# UX:
+#  - Параметри, релевантні лише вибраному режиму, автоматично показуються/ховаються.
+#  - Під час обчислень показується індикатор прогресу (індетермінований).
+#  - На вкладці "Overlay" клацання по зеленому контурі виключає/повертає частинку.
 
 from __future__ import annotations
 import sys, math, re, csv
@@ -11,13 +18,13 @@ import cv2
 from PIL import Image
 
 # PySide6
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QObject, QThread
 from PySide6.QtGui import QPixmap, QAction, QTransform, QPainter
 from PySide6.QtWidgets import (
     QApplication, QWidget, QFileDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QFormLayout, QDoubleSpinBox, QSpinBox, QTabWidget, QComboBox, QCheckBox,
     QMessageBox, QSplitter, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy,
-    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
+    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QProgressBar, QGroupBox
 )
 
 # Matplotlib
@@ -259,6 +266,110 @@ def np_to_qpix(img: np.ndarray) -> QPixmap:
     return QPixmap.fromImage(qim)
 
 
+# ----------- NEW: LoG scale-space utilities (for Nano mode) -----------
+
+def sigma_from_d_um(d_um: float, um_per_px: float) -> float:
+    # Для круглого блоба LoG: d ≈ 2*sqrt(2)*sigma
+    return max(0.6, (d_um / (2.0 * math.sqrt(2.0))) / um_per_px)
+
+def log_response(img_float: np.ndarray, sigma: float) -> np.ndarray:
+    # scale-normalized LoG: R = sigma^2 * (-Laplacian(Gσ * I))
+    blur = cv2.GaussianBlur(img_float, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    lap = cv2.Laplacian(blur, cv2.CV_32F, ksize=3)
+    return (sigma * sigma) * (-lap)
+
+def nms2d(resp: np.ndarray, radius_px: int) -> np.ndarray:
+    if radius_px < 1: radius_px = 1
+    k = 2 * radius_px + 1
+    dil = cv2.dilate(resp, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    peaks = (resp >= dil)
+    return peaks
+
+def detect_blobs_log(
+    gray: np.ndarray,
+    lev_img: np.ndarray,
+    um_per_px: float,
+    dmin_um: float,
+    dmax_um: float,
+    threshold_rel: float = 0.03,
+    minsep_um: float = 0.12,
+    roi_mask: np.ndarray | None = None,
+    min_rel_contrast: float = 0.0,
+) -> list[tuple[np.ndarray, float, float]]:
+    """
+    Повертає [(contour, diameter_um, circ)] як колові контури сумісні з GUI.
+    """
+    img = gray.astype(np.float32)
+    if roi_mask is None:
+        roi_mask = np.ones_like(gray, np.uint8) * 255
+
+    sig_lo = sigma_from_d_um(max(0.01, dmin_um), um_per_px)
+    sig_hi = sigma_from_d_um(max(dmax_um, dmin_um + 1e-6), um_per_px)
+    n_scales = 13
+    sigmas = np.exp(np.linspace(np.log(sig_lo), np.log(sig_hi), n_scales))
+
+    H, W = gray.shape
+    resp_max = np.zeros((H, W), np.float32)
+    arg_sigma = np.zeros((H, W), np.float32)
+
+    for s in sigmas:
+        R = log_response(img, float(s))
+        if roi_mask is not None:
+            R = cv2.bitwise_and(R, R, mask=roi_mask)
+        better = R > resp_max
+        resp_max[better] = R[better]
+        arg_sigma[better] = float(s)
+
+    mx = float(resp_max.max()) if resp_max.size else 0.0
+    if mx <= 0:
+        return []
+
+    thr = threshold_rel * mx
+    candidate = (resp_max >= thr) & (roi_mask.astype(bool))
+    nms = nms2d(resp_max, radius_px=1)
+    peaks = np.argwhere(candidate & nms)
+
+    vals = resp_max[candidate & nms]
+    order = np.argsort(-vals)
+    peaks = peaks[order]
+
+    minsep_px = max(1.0, minsep_um / um_per_px)
+    kept = []
+    occupied = np.zeros((H, W), np.uint8)
+    rad_occ = int(round(minsep_px))
+
+    for y, x in peaks:
+        if occupied[y, x]:
+            continue
+        s = float(arg_sigma[y, x])
+        if s <= 0:
+            continue
+        d_px = 2.0 * math.sqrt(2.0) * s
+        d_um = d_px * um_per_px
+
+        ring_th = max(3, int(0.15 * d_px))
+        mask_obj = np.zeros_like(gray, np.uint8)
+        cv2.circle(mask_obj, (int(x), int(y)), max(1, int(round(d_px/2))), 255, thickness=-1)
+        ring = np.zeros_like(gray, np.uint8)
+        cv2.circle(ring, (int(x), int(y)), max(1, int(round(d_px/2)) + ring_th), 255, thickness=ring_th)
+        ring = cv2.subtract(ring, mask_obj)
+        vals_in = lev_img[mask_obj == 255]; vals_bg = lev_img[ring == 255]
+        mean_in = float(vals_in.mean()) if vals_in.size else 0.0
+        mean_bg = float(vals_bg.mean()) if vals_bg.size else 0.0
+        rel_contrast = (mean_in - mean_bg) / 255.0
+        if rel_contrast < min_rel_contrast:
+            continue
+
+        if rad_occ > 0:
+            cv2.circle(occupied, (int(x), int(y)), rad_occ, 1, thickness=-1)
+
+        cnt = cv2.ellipse2Poly((int(x), int(y)), (int(round(d_px/2)), int(round(d_px/2))), 0, 0, 360, 6)
+        cnt = cnt.reshape((-1, 1, 2)).astype(np.int32)
+        kept.append((cnt, float(d_um), 1.0))  # circ≈1
+
+    return kept
+
+
 # ---------------- ImageView (zoom/pan + auto-fit) ----------------
 
 class ImageView(QGraphicsView):
@@ -293,7 +404,7 @@ class ImageView(QGraphicsView):
             return
         self.setTransform(QTransform())  # reset zoom
         r = self._item.boundingRect()
-        m = 2  # small margin px
+        m = 2
         self.fitInView(r.adjusted(m, m, -m, -m), Qt.KeepAspectRatio)
 
     def resizeEvent(self, e):
@@ -317,7 +428,7 @@ class ImageView(QGraphicsView):
         if e.modifiers() & Qt.ControlModifier:
             if e.key() == Qt.Key_1:
                 self._auto_fit = False
-                self.setTransform(QTransform())  # 100%
+                self.setTransform(QTransform())
                 e.accept(); return
             if e.key() == Qt.Key_0:
                 self._auto_fit = True
@@ -331,11 +442,9 @@ class ImageView(QGraphicsView):
 
     def mousePressEvent(self, e):
         if self._img_w:
-            # map to image coords and emit
             p = self.mapToScene(e.pos())
             x = int(round(p.x()))
             y = int(round(p.y()))
-            # clamp
             x = max(0, min(self._img_w - 1, x))
             y = max(0, min(self._img_h - 1, y))
             self.sig_clicked.emit(x, y)
@@ -399,6 +508,57 @@ class Params:
     split_touching: bool
     min_neck_um: float
     min_seg_d_um: float
+    # NEW for LoG:
+    analysis_mode: str            # "contours" | "log"
+    log_threshold_rel: float      # 0..1
+    log_minsep_um: float          # µm
+
+
+# -------- Worker (фонове обчислення з індикатором) --------
+
+class Worker(QObject):
+    finished = Signal(object)   # dict
+    failed   = Signal(object)   # str
+
+    def __init__(self, gray: np.ndarray, params: Params, image_path: Path):
+        super().__init__()
+        self.gray = gray
+        self.P = params
+        self.image_path = image_path
+
+    def run(self):
+        try:
+            roi_mask = make_roi_mask(self.gray.shape, self.P.exclude_top, self.P.exclude_bottom, self.P.exclude_left, self.P.exclude_right)
+            lev = preprocess(self.gray, self.P.clahe_clip, self.P.tophat_um, self.P.scale_um_per_px, self.P.level_strength)
+
+            if self.P.analysis_mode == "log":
+                results = detect_blobs_log(
+                    gray=self.gray, lev_img=lev, um_per_px=self.P.scale_um_per_px,
+                    dmin_um=self.P.min_d_um, dmax_um=self.P.max_d_um,
+                    threshold_rel=self.P.log_threshold_rel, minsep_um=self.P.log_minsep_um,
+                    roi_mask=roi_mask, min_rel_contrast=self.P.min_rel_contrast
+                )
+                out = {"lev": lev, "thr_raw": None, "thr_proc": None, "results": results}
+                self.finished.emit(out); return
+
+            # contour pipeline
+            bwB, bwD = threshold_pair(lev, roi_mask, method=self.P.thr_method, block_size=self.P.block_size, C=self.P.block_C)
+            kB = count_reasonable_components(bwB, self.P.scale_um_per_px, self.P.min_d_um, self.P.max_d_um)
+            kD = count_reasonable_components(bwD, self.P.scale_um_per_px, self.P.min_d_um, self.P.max_d_um)
+            bw = bwB if kB >= kD else bwD
+            thr_raw = bw.copy()
+
+            bw_m = morph_close(bw, self.P.closing_um, self.P.scale_um_per_px)
+            bw_m = morph_open(bw_m, self.P.open_um, self.P.scale_um_per_px)
+            bw_m = fill_small_holes(bw_m, 0.6)
+            if self.P.split_touching:
+                bw_m = split_touching_watershed(bw_m, self.P.scale_um_per_px, self.P.min_neck_um, self.P.min_seg_d_um)
+
+            results = measure_components(bw_m, self.P.min_d_um, self.P.max_d_um, self.P.min_circ, self.P.scale_um_per_px, lev, self.P.min_rel_contrast)
+            out = {"lev": lev, "thr_raw": thr_raw, "thr_proc": bw_m, "results": results}
+            self.finished.emit(out)
+        except Exception as e:
+            self.failed.emit(str(e))
 
 
 class MainWindow(QWidget):
@@ -422,6 +582,10 @@ class MainWindow(QWidget):
         self.excluded_idx: set[int] = set()
         self.remove_mode: bool = False
 
+        # threading
+        self._thread: QThread | None = None
+        self._worker: Worker | None = None
+
         self.build_ui()
 
     # ---------- UI ----------
@@ -432,6 +596,14 @@ class MainWindow(QWidget):
         self.meta_label = QLabel("Scale: —"); self.meta_label.setStyleSheet("color:#666")
         topbar.addWidget(self.btn_open); topbar.addWidget(self.meta_label); topbar.addStretch(1)
 
+        # progress bar (hidden by default)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)         # indeterminate
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(8)
+        self.progress.setVisible(False)
+        topbar.addWidget(self.progress)
+
         # Left controls
         left = QWidget(); form = QFormLayout(left)
 
@@ -440,6 +612,11 @@ class MainWindow(QWidget):
 
         self.cb_autoscale = QPushButton("Read scale from metadata"); self.cb_autoscale.clicked.connect(self.read_scale_meta)
         form.addRow(" ", self.cb_autoscale)
+
+        # --- Analysis mode ---
+        self.cb_mode = QComboBox(); self.cb_mode.addItems(["Contours (threshold)", "Nano (LoG)"])
+        self.cb_mode.currentIndexChanged.connect(self.update_param_visibility)
+        form.addRow("Analysis mode", self.cb_mode)
 
         # ROI
         self.sb_top = QDoubleSpinBox(); self.sb_top.setRange(0,0.9); self.sb_top.setSingleStep(0.01); self.sb_top.setValue(0.02)
@@ -452,49 +629,61 @@ class MainWindow(QWidget):
         lroi.addRow("Left", self.sb_left); lroi.addRow("Right", self.sb_right)
         form.addRow(QLabel("ROI exclude ratios"), row_roi)
 
-        # Filters
+        # --- General filters (both modes) ---
         self.sb_min_d = QDoubleSpinBox(); self.sb_min_d.setRange(0.0, 1000.0); self.sb_min_d.setDecimals(3); self.sb_min_d.setValue(0.01)
         self.sb_max_d = QDoubleSpinBox(); self.sb_max_d.setRange(0.0, 10000.0); self.sb_max_d.setDecimals(3); self.sb_max_d.setValue(10.0)
-        self.sb_min_circ = QDoubleSpinBox(); self.sb_min_circ.setRange(0.0, 1.0); self.sb_min_circ.setDecimals(3); self.sb_min_circ.setValue(0.10)
-        form.addRow("Min diameter (µm)", self.sb_min_d); form.addRow("Max diameter (µm)", self.sb_max_d); form.addRow("Min circularity", self.sb_min_circ)
+        self.sb_min_rc = QDoubleSpinBox(); self.sb_min_rc.setRange(0.0,1.0); self.sb_min_rc.setDecimals(2); self.sb_min_rc.setValue(0.15)
+        form.addRow("Min diameter (µm)", self.sb_min_d); form.addRow("Max diameter (µm)", self.sb_max_d)
+        form.addRow("Min rel. contrast", self.sb_min_rc)
 
-        # Morphology
-        self.sb_closing = QDoubleSpinBox(); self.sb_closing.setRange(0.0, 100.0); self.sb_closing.setDecimals(3); self.sb_closing.setValue(0.12)
-        self.sb_open = QDoubleSpinBox(); self.sb_open.setRange(0.0, 100.0); self.sb_open.setDecimals(3); self.sb_open.setValue(0.08)
-        form.addRow("Closing (µm)", self.sb_closing); form.addRow("Opening (µm)", self.sb_open)
-
-        # Threshold
-        self.cb_thr = QComboBox(); self.cb_thr.addItems(["otsu","adaptive"])
-        self.sb_block = QSpinBox(); self.sb_block.setRange(3,999); self.sb_block.setValue(31)
-        self.sb_C = QSpinBox(); self.sb_C.setRange(-255,255); self.sb_C.setValue(-10)
-        form.addRow("Threshold", self.cb_thr); form.addRow("Adaptive block size", self.sb_block); form.addRow("Adaptive C", self.sb_C)
-
-        # Preprocess
+        # Preprocess (both)
         self.sb_clahe = QDoubleSpinBox(); self.sb_clahe.setRange(0.0,10.0); self.sb_clahe.setDecimals(2); self.sb_clahe.setValue(2.0)
         self.sb_tophat = QDoubleSpinBox(); self.sb_tophat.setRange(0.0,100.0); self.sb_tophat.setDecimals(3); self.sb_tophat.setValue(0.0)
         self.sb_level = QDoubleSpinBox(); self.sb_level.setRange(0.0,1.5); self.sb_level.setDecimals(2); self.sb_level.setValue(0.3)
-        self.sb_min_rc = QDoubleSpinBox(); self.sb_min_rc.setRange(0.0,1.0); self.sb_min_rc.setDecimals(2); self.sb_min_rc.setValue(0.15)
-        form.addRow("CLAHE clip", self.sb_clahe); form.addRow("Top-hat radius (µm)", self.sb_tophat)
-        form.addRow("Level strength", self.sb_level); form.addRow("Min rel. contrast", self.sb_min_rc)
+        form.addRow("CLAHE clip", self.sb_clahe); form.addRow("Top-hat radius (µm)", self.sb_tophat); form.addRow("Level strength", self.sb_level)
 
-        # Watershed
+        # --- Threshold-only group ---
+        self.grp_thr = QGroupBox("Threshold-only")
+        lay_thr = QFormLayout(self.grp_thr)
+        self.sb_min_circ = QDoubleSpinBox(); self.sb_min_circ.setRange(0.0, 1.0); self.sb_min_circ.setDecimals(3); self.sb_min_circ.setValue(0.10)
+        self.sb_closing = QDoubleSpinBox(); self.sb_closing.setRange(0.0, 100.0); self.sb_closing.setDecimals(3); self.sb_closing.setValue(0.12)
+        self.sb_open = QDoubleSpinBox(); self.sb_open.setRange(0.0, 100.0); self.sb_open.setDecimals(3); self.sb_open.setValue(0.08)
+        self.cb_thr = QComboBox(); self.cb_thr.addItems(["otsu","adaptive"])
+        self.sb_block = QSpinBox(); self.sb_block.setRange(3,999); self.sb_block.setValue(31)
+        self.sb_C = QSpinBox(); self.sb_C.setRange(-255,255); self.sb_C.setValue(-10)
         self.cb_split = QCheckBox("Split touching (watershed)"); self.cb_split.setChecked(False)
         self.sb_neck = QDoubleSpinBox(); self.sb_neck.setRange(0.0,10.0); self.sb_neck.setDecimals(3); self.sb_neck.setValue(0.12)
         self.sb_seg = QDoubleSpinBox(); self.sb_seg.setRange(0.0,100.0); self.sb_seg.setDecimals(3); self.sb_seg.setValue(0.20)
-        form.addRow(self.cb_split); form.addRow("Min neck (µm)", self.sb_neck); form.addRow("Min segment d (µm)", self.sb_seg)
 
-        # Run / Export
-        self.btn_run = QPushButton("Run analysis"); self.btn_run.clicked.connect(self.run_analysis); form.addRow(self.btn_run)
+        lay_thr.addRow("Min circularity", self.sb_min_circ)
+        lay_thr.addRow("Closing (µm)", self.sb_closing); lay_thr.addRow("Opening (µm)", self.sb_open)
+        lay_thr.addRow("Threshold", self.cb_thr); lay_thr.addRow("Adaptive block size", self.sb_block); lay_thr.addRow("Adaptive C", self.sb_C)
+        lay_thr.addRow(self.cb_split); lay_thr.addRow("Min neck (µm)", self.sb_neck); lay_thr.addRow("Min segment d (µm)", self.sb_seg)
+        form.addRow(self.grp_thr)
+
+        # --- LoG-only group ---
+        self.grp_log = QGroupBox("LoG-only")
+        lay_log = QFormLayout(self.grp_log)
+        self.sb_log_thr = QDoubleSpinBox(); self.sb_log_thr.setRange(0.0, 1.0); self.sb_log_thr.setDecimals(3); self.sb_log_thr.setValue(0.030)
+        self.sb_log_sep = QDoubleSpinBox(); self.sb_log_sep.setRange(0.0, 10.0); self.sb_log_sep.setDecimals(3); self.sb_log_sep.setValue(0.120)
+        lay_log.addRow("LoG threshold (rel)", self.sb_log_thr)
+        lay_log.addRow("LoG min separation (µm)", self.sb_log_sep)
+        form.addRow(self.grp_log)
+
+        # Run / Export / Interactions
+        self.btn_run = QPushButton("Run analysis"); self.btn_run.clicked.connect(self.run_analysis)
         self.btn_export_csv = QPushButton("Export CSV…"); self.btn_export_csv.clicked.connect(self.export_csv)
         self.btn_save_overlay = QPushButton("Save overlay…"); self.btn_save_overlay.clicked.connect(self.save_overlay)
-        form.addRow(self.btn_export_csv); form.addRow(self.btn_save_overlay)
-
-        # Exclusions
         self.btn_toggle_remove = QPushButton("Remove blobs (click)"); self.btn_toggle_remove.setCheckable(True)
         self.btn_toggle_remove.setToolTip("Click a green contour to exclude / click again to restore")
         self.btn_toggle_remove.toggled.connect(self.on_toggle_remove)
         self.btn_clear_excl = QPushButton("Clear exclusions"); self.btn_clear_excl.clicked.connect(self.on_clear_exclusions)
-        form.addRow(self.btn_toggle_remove); form.addRow(self.btn_clear_excl)
+
+        form.addRow(self.btn_run)
+        form.addRow(self.btn_export_csv)
+        form.addRow(self.btn_save_overlay)
+        form.addRow(self.btn_toggle_remove)
+        form.addRow(self.btn_clear_excl)
 
         # Right panel (views + stats)
         right = QWidget(); right_layout = QVBoxLayout(right); right_layout.setContentsMargins(0,0,0,0)
@@ -511,7 +700,7 @@ class MainWindow(QWidget):
         self.plot_hist = MplWidget(); self.tabs.addTab(self.plot_hist, "Histogram")
         self.plot_cum  = MplWidget(); self.tabs.addTab(self.plot_cum,  "Cumulative")
 
-        right_layout.addWidget(self.tabs, 1)  # stretch=1 — займе весь простір
+        right_layout.addWidget(self.tabs, 1)
 
         self.stats_label = QLabel("—")
         self.table = QTableWidget(0,1); self.table.setHorizontalHeaderLabels(["diameter (µm)"])
@@ -528,13 +717,23 @@ class MainWindow(QWidget):
         # Root
         root = QVBoxLayout(self)
         root.addLayout(topbar)
-        root.addWidget(splitter, 1)  # stretch=1 — без «шапки»
+        root.addWidget(splitter, 1)
 
         self.add_actions()
+        self.update_param_visibility()  # init visibility
 
     def add_actions(self):
         act_open = QAction(self); act_open.setShortcut("Ctrl+O"); act_open.triggered.connect(self.open_image); self.addAction(act_open)
         act_run  = QAction(self); act_run.setShortcut("Ctrl+R"); act_run.triggered.connect(self.run_analysis); self.addAction(act_run)
+
+    # ---------- Visibility toggle ----------
+
+    def update_param_visibility(self):
+        is_log = (self.cb_mode.currentIndex() == 1)
+        self.grp_log.setVisible(is_log)
+        self.grp_thr.setVisible(not is_log)
+        # вкладка "Threshold" має сенс лише у threshold-режимі
+        self.tabs.setTabEnabled(self.tabs.indexOf(self.view_thresh), not is_log)
 
     # ---------- Events / helpers ----------
 
@@ -566,6 +765,7 @@ class MainWindow(QWidget):
     def current_params(self) -> Params:
         scale = self.sb_scale.value()
         if scale <= 0 and self.um_per_px_from_meta: scale = self.um_per_px_from_meta
+        analysis_mode = "log" if self.cb_mode.currentIndex() == 1 else "contours"
         return Params(
             scale_um_per_px=scale if scale > 0 else None,
             exclude_top=self.sb_top.value(), exclude_bottom=self.sb_bottom.value(),
@@ -578,7 +778,29 @@ class MainWindow(QWidget):
             tophat_um=self.sb_tophat.value(), level_strength=self.sb_level.value(),
             split_touching=self.cb_split.isChecked(), min_neck_um=self.sb_neck.value(),
             min_seg_d_um=self.sb_seg.value(),
+            analysis_mode=analysis_mode,
+            log_threshold_rel=self.sb_log_thr.value(),
+            log_minsep_um=self.sb_log_sep.value(),
         )
+
+    def set_busy(self, busy: bool):
+        # блокування і показ індикатора
+        for w in [
+            self.btn_open, self.btn_run, self.btn_export_csv, self.btn_save_overlay,
+            self.btn_toggle_remove, self.btn_clear_excl, self.cb_mode
+        ]:
+            w.setEnabled(not busy)
+
+        self.btn_open.setEnabled(not busy)
+        self.btn_run.setEnabled(not busy)
+        self.btn_export_csv.setEnabled(not busy)
+        self.btn_save_overlay.setEnabled(not busy)
+        self.btn_toggle_remove.setEnabled(not busy)
+        self.btn_clear_excl.setEnabled(not busy)
+        self.cb_mode.setEnabled(not busy)
+
+        self.progress.setVisible(busy)
+        QApplication.processEvents()
 
     def run_analysis(self):
         if self.gray is None or self.image_path is None:
@@ -586,29 +808,46 @@ class MainWindow(QWidget):
         P = self.current_params()
         if P.scale_um_per_px is None or P.scale_um_per_px <= 0:
             QMessageBox.warning(self, "Scale", "Set Scale (µm/px) or read from metadata."); return
-        try:
-            roi_mask = make_roi_mask(self.gray.shape, P.exclude_top, P.exclude_bottom, P.exclude_left, P.exclude_right)
-            self.lev = preprocess(self.gray, P.clahe_clip, P.tophat_um, P.scale_um_per_px, P.level_strength)
-            bwB, bwD = threshold_pair(self.lev, roi_mask, method=P.thr_method, block_size=P.block_size, C=P.block_C)
-            kB = count_reasonable_components(bwB, P.scale_um_per_px, P.min_d_um, P.max_d_um)
-            kD = count_reasonable_components(bwD, P.scale_um_per_px, P.min_d_um, P.max_d_um)
-            bw = bwB if kB >= kD else bwD
-            self.thr_raw = bw.copy()
 
-            bw_m = morph_close(bw, P.closing_um, P.scale_um_per_px)
-            bw_m = morph_open(bw_m, P.open_um, P.scale_um_per_px)
-            bw_m = fill_small_holes(bw_m, 0.6)
-            if P.split_touching:
-                bw_m = split_touching_watershed(bw_m, P.scale_um_per_px, P.min_neck_um, P.min_seg_d_um)
-            self.thr_proc = bw_m
+        # якщо попередній тред ще живий — просто ігноруємо повторний запуск
+        if self._thread and self._thread.isRunning():
+            return
 
-            self.results = measure_components(bw_m, P.min_d_um, P.max_d_um, P.min_circ, P.scale_um_per_px, self.lev, P.min_rel_contrast)
-            self.excluded_idx.clear()
-            self._rebuild_overlay_and_stats()
-            self.render_previews(); self.update_stats_table()
-            self.tabs.setCurrentWidget(self.view_overlay)
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Processing failed:\n{e}")
+        self.set_busy(True)
+        self._thread = QThread(self)
+        self._worker = Worker(self.gray.copy(), P, self.image_path)
+        self._worker.moveToThread(self._thread)
+
+        # Старт → run()
+        self._thread.started.connect(self._worker.run)
+
+        # Обробка результату / помилки
+        self._worker.finished.connect(self.on_worker_finished)
+        self._worker.failed.connect(self.on_worker_failed)
+
+        # Завершення та прибирання
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.failed.connect(self._thread.quit)
+        self._thread.finished.connect(self._on_thread_finished)
+        self._thread.finished.connect(self._worker.deleteLater)
+
+        self._thread.start()
+
+    def _on_thread_finished(self):
+        self.set_busy(False)
+        self._worker = None
+        self._thread = None
+
+    def on_worker_finished(self, out: dict):
+        self.lev = out.get("lev"); self.thr_raw = out.get("thr_raw"); self.thr_proc = out.get("thr_proc")
+        self.results = out.get("results", [])
+        self.excluded_idx.clear()
+        self._rebuild_overlay_and_stats()
+        self.render_previews(); self.update_stats_table()
+        self.tabs.setCurrentWidget(self.view_overlay)
+
+    def on_worker_failed(self, msg: str):
+        QMessageBox.critical(self, "Error", f"Processing failed:\n{msg}")
 
     # ---------- Exclusions ----------
 
@@ -652,7 +891,7 @@ class MainWindow(QWidget):
         if self.lev is not None:
             self.view_leveled.set_image(cv2.cvtColor(self.lev, cv2.COLOR_GRAY2BGR))
         thr_to_show = self.thr_proc if self.thr_proc is not None else self.thr_raw
-        if thr_to_show is not None:
+        if thr_to_show is not None and self.cb_mode.currentIndex() == 0:
             self.view_thresh.set_image(thr_to_show)
         if self.overlay_img is not None:
             self.view_overlay.set_image(self.overlay_img)
