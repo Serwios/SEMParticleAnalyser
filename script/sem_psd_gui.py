@@ -507,6 +507,7 @@ class Worker(QObject):
 class MainWindow(QWidget):
     # Auto-switch to nm if scale is finer than this (µm/px)
     auto_nm_threshold_um_per_px = 0.10  # <0.10 µm/px → show nm
+    label_scale = 1.1
 
     def __init__(self):
         super().__init__()
@@ -996,6 +997,35 @@ class MainWindow(QWidget):
         # Ensure units reflect current scale if auto-units is enabled
         self.maybe_update_auto_units()
 
+    def _best_label_box(self, cx, cy, tw, th, pad_x, pad_y, W, H, v):
+        # кандидати: вправо/вліво, вище/нижче
+        offs = [
+            (+int(12 / v), -int(12 / v)),  # right-up
+            (+int(12 / v), +int(12 / v)),  # right-down
+            (-int(12 / v) - tw - 2 * pad_x, -int(12 / v)),  # left-up
+            (-int(12 / v) - tw - 2 * pad_x, +int(12 / v)),  # left-down
+        ]
+        best = None;
+        best_score = -1e9
+        for dx, dy in offs:
+            bx0 = cx + dx;
+            by0 = cy + dy
+            bx1 = bx0 + tw + 2 * pad_x;
+            by1 = by0 + th + 2 * pad_y
+            # штраф за вихід за межі
+            over = max(0, 2 - bx0) + max(0, 2 - by0) + max(0, bx1 - (W - 2)) + max(0, by1 - (H - 2))
+            score = -5 * over - (abs(dy) + abs(dx))  # пріоритет близьких і в межах
+            if score > best_score:
+                best_score = score;
+                best = (bx0, by0, bx1, by1)
+        # нормалізуємо, щоб точно вмістити
+        bx0, by0, bx1, by1 = best
+        bx0 = min(max(2, bx0), W - 2);
+        by0 = min(max(2, by0), H - 2)
+        bx1 = min(max(2, bx1), W - 2);
+        by1 = min(max(2, by1), H - 2)
+        return bx0, by0, bx1, by1
+
     # ---------- Run ----------
     def run_analysis(self):
         if self.gray is None or self.image_path is None:
@@ -1119,16 +1149,53 @@ class MainWindow(QWidget):
             if M["m00"] != 0:
                 cx = int(M["m10"] / M["m00"]);
                 cy = int(M["m01"] / M["m00"])
+                # компактний центр- маркер
                 cv2.circle(img, (cx, cy), 3, (0, 0, 0), -1, lineType=cv2.LINE_AA)
                 cv2.circle(img, (cx, cy), 2, (255, 255, 255), -1, lineType=cv2.LINE_AA)
 
-                unit = self.unit_label();
+                # ---- жовтий, більший підпис ----
+                unit = self.unit_label()
                 factor = self.unit_factor()
-                txt = f"{d_um * factor:.1f} {unit}"
-                (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-                x0, y0 = cx + 8, max(10, cy - 10)
-                cv2.rectangle(img, (x0 - 4, y0 - th - 6), (x0 + tw + 4, y0 + 6), (0, 0, 0), -1)
-                cv2.putText(img, txt, (x0, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+                val = d_um * factor
+                txt_num = f"{val:.1f}"
+                txt_unit = f" {unit}"
+
+                v = max(1e-3, self._overlay_view_scale())
+                S = getattr(self, "label_scale", 1.35)  # масштаб підпису
+
+                # Більші розміри, але з екранною стабілізацією
+                fs_num = max(0.42 * S, min(0.80 * S, (0.62 * S) / v))  # число
+                fs_unit = max(0.36 * S, min(0.72 * S, (0.50 * S) / v))  # одиниці трохи менші
+                th_text = max(1, min(3, int(round(1.6 * S / v))))  # товщина контуру
+                pad_x = max(8, min(18, int(round(10 * S / v))))  # відступи
+                pad_y = max(6, min(12, int(round(7 * S / v))))
+                th_box = max(1, min(2, int(round(1.2 * S / v))))  # рамка 1–2 px
+
+                # розміри текстів
+                (tn_w, tn_h), _ = cv2.getTextSize(txt_num, cv2.FONT_HERSHEY_SIMPLEX, fs_num, th_text)
+                (tu_w, tu_h), _ = cv2.getTextSize(txt_unit, cv2.FONT_HERSHEY_SIMPLEX, fs_unit, th_text)
+                tw = tn_w + tu_w
+                th = max(tn_h, tu_h)
+
+                H, W = img.shape[:2]
+                bx0, by0, bx1, by1 = self._best_label_box(cx, cy, tw, th, pad_x, pad_y, W, H, v)
+
+                # фоновий бокс + тонка жовта рамка (той самий колір)
+                overlay_bg = img.copy()
+                cv2.rectangle(overlay_bg, (bx0, by0), (bx1, by1), (0, 0, 0), -1)
+                cv2.addWeighted(overlay_bg, 0.50, img, 0.50, 0, dst=img)
+                cv2.rectangle(img, (bx0, by0), (bx1, by1), (0, 255, 255), th_box, lineType=cv2.LINE_AA)
+
+                # жовтий текст з чорним аутлайном (краще читається), «nm» трохи дрібніше
+                org = (bx0 + pad_x, by0 + pad_y + th)
+                cv2.putText(img, txt_num, org, cv2.FONT_HERSHEY_SIMPLEX, fs_num, (0, 0, 0), th_text + 2, cv2.LINE_AA)
+                cv2.putText(img, txt_num, org, cv2.FONT_HERSHEY_SIMPLEX, fs_num, (0, 255, 255), th_text, cv2.LINE_AA)
+
+                org_unit = (org[0] + tn_w, org[1])
+                cv2.putText(img, txt_unit, org_unit, cv2.FONT_HERSHEY_SIMPLEX, fs_unit, (0, 0, 0), th_text + 2,
+                            cv2.LINE_AA)
+                cv2.putText(img, txt_unit, org_unit, cv2.FONT_HERSHEY_SIMPLEX, fs_unit, (0, 255, 255), th_text,
+                            cv2.LINE_AA)
 
         self.view_overlay.set_image(img)
 
@@ -1264,6 +1331,15 @@ class MainWindow(QWidget):
             "Failed to save the overlay image.\n"
             "Ensure the folder is writable and the filename has a valid extension (.png / .jpg)."
         )
+
+    def _overlay_view_scale(self) -> float:
+        try:
+            tr = self.view_overlay.transform()
+            s = (float(tr.m11()) + float(tr.m22())) * 0.5
+            return s if s > 1e-3 else 1.0
+        except Exception:
+            return 1.0
+
 
 def main():
     app = QApplication(sys.argv)
