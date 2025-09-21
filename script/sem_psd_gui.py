@@ -675,6 +675,7 @@ class MainWindow(QWidget):
         self.plot_hist = MplWidget(); self.tabs.addTab(self.plot_hist, "Histogram")
         self.plot_cum  = MplWidget(); self.tabs.addTab(self.plot_cum,  "Cumulative")
         right_layout.addWidget(self.tabs, 1)
+        self.tabs.currentChanged.connect(lambda _: self.render_overlay_with_highlight())
 
         self.stats_label = QLabel("—")
         self.table = QTableWidget(0,1); self.table.setHorizontalHeaderLabels(["diameter (µm)"])
@@ -1054,7 +1055,6 @@ class MainWindow(QWidget):
             self.hover_idx = ridx
         else:
             self.hover_idx = None
-        self.tabs.setCurrentWidget(self.view_overlay)
         self.render_overlay_with_highlight()
 
     def eventFilter(self, obj, event):
@@ -1090,36 +1090,31 @@ class MainWindow(QWidget):
 
     # ---------- Rendering / Table / Export ----------
     def render_overlay_with_highlight(self):
+        # оновлюємо підсвітку тільки коли активна вкладка Overlay
+        if self.tabs.currentWidget() is not self.view_overlay:
+            return
         if self.overlay_img is None:
             return
 
-        base = self.overlay_img  # з контурами (зелений/червоний)
-        img = base.copy()
-
+        img = self.overlay_img.copy()
         if self.hover_idx is not None and 0 <= self.hover_idx < len(self.results):
             cnt, d_um, _ = self.results[self.hover_idx]
 
-            # 1) приглушити все полотно, щоб виділити одну частинку
+            # приглушення інших + напівпрозора жовта заливка
+            base = img.copy()
             img = (img * 0.35).astype(np.uint8)
-
-            # маска частинки (з невеликим розширенням, щоб повернути яскравість довкола)
             mask = np.zeros(img.shape[:2], np.uint8)
             cv2.drawContours(mask, [cnt], -1, 255, thickness=-1)
-            mask_dil = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)), iterations=1)
-
-            # повернемо оригінальну яскравість у зоні частинки + невеликий «ореол»
+            mask_dil = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)), 1)
             img[mask_dil > 0] = base[mask_dil > 0]
-
-            # 2) напівпрозора жовта заливка
             fill = img.copy()
             cv2.drawContours(fill, [cnt], -1, (0, 255, 255), thickness=-1)
             cv2.addWeighted(fill, 0.35, img, 0.65, 0, dst=img)
 
-            # 3) контур з «глоу»: чорний товстий + зверху жовтий тонший
+            # вужчі контури + менший центр (як просив)
             cv2.drawContours(img, [cnt], -1, (0, 0, 0), 3, lineType=cv2.LINE_AA)
             cv2.drawContours(img, [cnt], -1, (0, 255, 255), 2, lineType=cv2.LINE_AA)
 
-            # 4) маркер у центрі маси + підпис розміру у вибраних одиницях
             M = cv2.moments(cnt)
             if M["m00"] != 0:
                 cx = int(M["m10"] / M["m00"]);
@@ -1127,11 +1122,9 @@ class MainWindow(QWidget):
                 cv2.circle(img, (cx, cy), 3, (0, 0, 0), -1, lineType=cv2.LINE_AA)
                 cv2.circle(img, (cx, cy), 2, (255, 255, 255), -1, lineType=cv2.LINE_AA)
 
-                unit = self.unit_label()
+                unit = self.unit_label();
                 factor = self.unit_factor()
                 txt = f"{d_um * factor:.1f} {unit}"
-
-                # фон/рамка під текст для читабельності
                 (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
                 x0, y0 = cx + 8, max(10, cy - 10)
                 cv2.rectangle(img, (x0 - 4, y0 - th - 6), (x0 + tw + 4, y0 + 6), (0, 0, 0), -1)
