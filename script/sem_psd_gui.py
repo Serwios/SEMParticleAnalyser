@@ -10,7 +10,7 @@ import numpy as np
 import cv2
 from PIL import Image
 
-from PySide6.QtCore import Qt, Signal, QObject, QThread
+from PySide6.QtCore import Qt, Signal, QObject, QThread, QEvent
 from PySide6.QtGui import QPixmap, QAction, QTransform, QPainter, QImage, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QWidget, QFileDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
@@ -505,7 +505,7 @@ class Worker(QObject):
 # ---------------- MainWindow ----------------
 
 class MainWindow(QWidget):
-    # threshold for auto-switching units based on scale
+    # Auto-switch to nm if scale is finer than this (µm/px)
     auto_nm_threshold_um_per_px = 0.10  # <0.10 µm/px → show nm
 
     def __init__(self):
@@ -529,6 +529,10 @@ class MainWindow(QWidget):
         self._thread: QThread | None = None
         self._worker: Worker | None = None
         self._open_in_progress: bool = False
+
+        # Hover/highlight state for table/overlay
+        self.row_to_result: list[int] = []   # row index -> result index
+        self.hover_idx: int | None = None    # highlighted result index
 
         self.build_ui()
 
@@ -676,6 +680,10 @@ class MainWindow(QWidget):
         self.table = QTableWidget(0,1); self.table.setHorizontalHeaderLabels(["diameter (µm)"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.setMinimumHeight(150)
+        # Hover support:
+        self.table.setMouseTracking(True)
+        self.table.cellEntered.connect(self.on_table_cell_entered)
+        self.table.viewport().installEventFilter(self)
         right_layout.addWidget(self.stats_label, 0); right_layout.addWidget(self.table, 0)
 
         # -------- Welcome screen --------
@@ -984,7 +992,7 @@ class MainWindow(QWidget):
             f"Parameters updated for the current mode."
         )
 
-        # If auto-units is enabled, ensure units reflect current scale
+        # Ensure units reflect current scale if auto-units is enabled
         self.maybe_update_auto_units()
 
     # ---------- Run ----------
@@ -1011,6 +1019,7 @@ class MainWindow(QWidget):
     def on_worker_finished(self, out: dict):
         self.lev = out.get("lev"); self.thr_raw = out.get("thr_raw"); self.thr_proc = out.get("thr_proc")
         self.results = out.get("results", []); self.excluded_idx.clear()
+        self.hover_idx = None
         self._rebuild_overlay_and_stats(); self.render_previews(); self.update_stats_table(); self.tabs.setCurrentWidget(self.view_overlay)
 
     def on_worker_failed(self, msg: str):
@@ -1023,6 +1032,7 @@ class MainWindow(QWidget):
 
     def on_clear_exclusions(self):
         self.excluded_idx.clear()
+        self.hover_idx = None
         self._rebuild_overlay_and_stats(); self.render_previews(); self.update_stats_table()
 
     def on_overlay_clicked(self, x: int, y: int):
@@ -1034,8 +1044,38 @@ class MainWindow(QWidget):
         if hit is None: return
         if hit in self.excluded_idx: self.excluded_idx.remove(hit)
         else: self.excluded_idx.add(hit)
+        self.hover_idx = None
         self._rebuild_overlay_and_stats(); self.render_previews(); self.update_stats_table()
 
+    # ---------- Hover ↔ highlight ----------
+    def on_table_cell_entered(self, row: int, col: int):
+        if 0 <= row < len(self.row_to_result):
+            ridx = self.row_to_result[row]
+            self.hover_idx = ridx
+        else:
+            self.hover_idx = None
+        self.tabs.setCurrentWidget(self.view_overlay)
+        self.render_overlay_with_highlight()
+
+    def eventFilter(self, obj, event):
+        # Clear highlight when cursor leaves the table viewport,
+        # or update it on mouse move (for blank areas)
+        if obj is self.table.viewport():
+            if event.type() == QEvent.Leave:
+                if self.hover_idx is not None:
+                    self.hover_idx = None
+                    self.render_overlay_with_highlight()
+            elif event.type() == QEvent.MouseMove:
+                idx = self.table.indexAt(event.pos())
+                if idx.isValid():
+                    self.on_table_cell_entered(idx.row(), idx.column())
+                else:
+                    if self.hover_idx is not None:
+                        self.hover_idx = None
+                        self.render_overlay_with_highlight()
+        return super().eventFilter(obj, event)
+
+    # ---------- Build overlay & stats ----------
     def _rebuild_overlay_and_stats(self):
         if self.gray is None: return
         over = cv2.cvtColor(self.gray, cv2.COLOR_GRAY2BGR)
@@ -1049,6 +1089,56 @@ class MainWindow(QWidget):
         self.stats = stats_from_diams(self.diams_um)
 
     # ---------- Rendering / Table / Export ----------
+    def render_overlay_with_highlight(self):
+        if self.overlay_img is None:
+            return
+
+        base = self.overlay_img  # з контурами (зелений/червоний)
+        img = base.copy()
+
+        if self.hover_idx is not None and 0 <= self.hover_idx < len(self.results):
+            cnt, d_um, _ = self.results[self.hover_idx]
+
+            # 1) приглушити все полотно, щоб виділити одну частинку
+            img = (img * 0.35).astype(np.uint8)
+
+            # маска частинки (з невеликим розширенням, щоб повернути яскравість довкола)
+            mask = np.zeros(img.shape[:2], np.uint8)
+            cv2.drawContours(mask, [cnt], -1, 255, thickness=-1)
+            mask_dil = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)), iterations=1)
+
+            # повернемо оригінальну яскравість у зоні частинки + невеликий «ореол»
+            img[mask_dil > 0] = base[mask_dil > 0]
+
+            # 2) напівпрозора жовта заливка
+            fill = img.copy()
+            cv2.drawContours(fill, [cnt], -1, (0, 255, 255), thickness=-1)
+            cv2.addWeighted(fill, 0.35, img, 0.65, 0, dst=img)
+
+            # 3) контур з «глоу»: чорний товстий + зверху жовтий тонший
+            cv2.drawContours(img, [cnt], -1, (0, 0, 0), 3, lineType=cv2.LINE_AA)
+            cv2.drawContours(img, [cnt], -1, (0, 255, 255), 2, lineType=cv2.LINE_AA)
+
+            # 4) маркер у центрі маси + підпис розміру у вибраних одиницях
+            M = cv2.moments(cnt)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"]);
+                cy = int(M["m01"] / M["m00"])
+                cv2.circle(img, (cx, cy), 3, (0, 0, 0), -1, lineType=cv2.LINE_AA)
+                cv2.circle(img, (cx, cy), 2, (255, 255, 255), -1, lineType=cv2.LINE_AA)
+
+                unit = self.unit_label()
+                factor = self.unit_factor()
+                txt = f"{d_um * factor:.1f} {unit}"
+
+                # фон/рамка під текст для читабельності
+                (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                x0, y0 = cx + 8, max(10, cy - 10)
+                cv2.rectangle(img, (x0 - 4, y0 - th - 6), (x0 + tw + 4, y0 + 6), (0, 0, 0), -1)
+                cv2.putText(img, txt, (x0, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+
+        self.view_overlay.set_image(img)
+
     def render_previews(self):
         if self.gray is not None:
             self.view_original.set_image(cv2.cvtColor(self.gray, cv2.COLOR_GRAY2BGR))
@@ -1057,8 +1147,9 @@ class MainWindow(QWidget):
         thr_to_show = self.thr_proc if self.thr_proc is not None else self.thr_raw
         if thr_to_show is not None and self.cb_mode.currentIndex() == 0:
             self.view_thresh.set_image(thr_to_show)
-        if self.overlay_img is not None:
-            self.view_overlay.set_image(self.overlay_img)
+
+        # overlay (with potential highlight)
+        self.render_overlay_with_highlight()
 
         factor = self.unit_factor()
         unit = self.unit_label()
@@ -1069,15 +1160,18 @@ class MainWindow(QWidget):
         self.plot_cum.plot_cum(d_disp, st_disp, unit)
 
     def update_stats_table(self):
-        rows: list[tuple[float, bool]] = []
+        # Build order: active first, then excluded, but keep a mapping row->result index
+        rows: list[tuple[int, float, bool]] = []  # (result_idx, diameter_um, excluded)
         for i, (_cnt, d, _c) in enumerate(self.results):
-            if i not in self.excluded_idx: rows.append((d, False))
+            if i not in self.excluded_idx: rows.append((i, d, False))
         for i, (_cnt, d, _c) in enumerate(self.results):
-            if i in self.excluded_idx: rows.append((d, True))
+            if i in self.excluded_idx: rows.append((i, d, True))
 
         unit = self.unit_label()
         factor = self.unit_factor()
         self.table.setHorizontalHeaderLabels([f"diameter ({unit})"])
+
+        self.row_to_result = [ri for (ri, _d, _ex) in rows]
 
         if rows:
             st = self.scale_stats_for_display(self.stats)
@@ -1088,12 +1182,12 @@ class MainWindow(QWidget):
                 f"std={st['std']:.3f} {unit}"
             )
             self.table.setRowCount(len(rows))
-            for i, (v_um, excl) in enumerate(rows):
-                v = v_um * factor
+            for row, (_ri, d_um, excl) in enumerate(rows):
+                v = d_um * factor
                 cell = QTableWidgetItem(f"{v:.6f}")
                 if excl:
                     cell.setForeground(Qt.gray); f = cell.font(); f.setItalic(True); cell.setFont(f)
-                self.table.setItem(i, 0, cell)
+                self.table.setItem(row, 0, cell)
         else:
             self.stats_label.setText("No particles accepted. Adjust parameters.")
             self.table.setRowCount(0)
