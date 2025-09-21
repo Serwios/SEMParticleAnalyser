@@ -431,24 +431,24 @@ class MplWidget(QWidget):
         self.canvas = FigureCanvas(self.fig)
         layout = QVBoxLayout(self); layout.setContentsMargins(0, 0, 0, 0); layout.addWidget(self.canvas)
 
-    def plot_hist(self, d_um: np.ndarray, st: dict, title: str):
+    def plot_hist(self, d_vals: np.ndarray, st: dict, title: str, unit: str):
         self.fig.clear(); ax = self.fig.add_subplot(111)
-        if d_um.size:
-            ax.hist(d_um, bins=40)
+        if d_vals.size:
+            ax.hist(d_vals, bins=40)
             for name in ("D10","D50","D90"):
-                ax.axvline(st[name], linestyle="--", label=f"{name}={st[name]:.2f} µm")
-            ax.set_xlabel("Particle diameter (µm)"); ax.set_ylabel("Count"); ax.set_title(title)
+                ax.axvline(st[name], linestyle="--", label=f"{name}={st[name]:.2f} {unit}")
+            ax.set_xlabel(f"Particle diameter ({unit})"); ax.set_ylabel("Count"); ax.set_title(title)
             ax.grid(True); ax.legend()
         self.canvas.draw()
 
-    def plot_cum(self, d_um: np.ndarray, st: dict):
+    def plot_cum(self, d_vals: np.ndarray, st: dict, unit: str):
         self.fig.clear(); ax = self.fig.add_subplot(111)
-        if d_um.size:
-            s = np.sort(d_um); cum = np.arange(1, s.size+1)/s.size*100.0
+        if d_vals.size:
+            s = np.sort(d_vals); cum = np.arange(1, s.size+1)/s.size*100.0
             ax.plot(s, cum)
             for name in ("D10","D50","D90"):
-                ax.axvline(st[name], linestyle="--", label=f"{name}={st[name]:.2f} µm")
-            ax.set_xlabel("Particle diameter (µm)"); ax.set_ylabel("Cumulative %"); ax.set_title("Cumulative PSD")
+                ax.axvline(st[name], linestyle="--", label=f"{name}={st[name]:.2f} {unit}")
+            ax.set_xlabel(f"Particle diameter ({unit})"); ax.set_ylabel("Cumulative %"); ax.set_title("Cumulative PSD")
             ax.grid(True); ax.legend()
         self.canvas.draw()
 
@@ -505,6 +505,9 @@ class Worker(QObject):
 # ---------------- MainWindow ----------------
 
 class MainWindow(QWidget):
+    # threshold for auto-switching units based on scale
+    auto_nm_threshold_um_per_px = 0.10  # <0.10 µm/px → show nm
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SEM PSD (Particles Analysis)")
@@ -557,6 +560,8 @@ class MainWindow(QWidget):
 
         self.sb_scale = QDoubleSpinBox(); self.sb_scale.setRange(1e-6, 1000.0); self.sb_scale.setDecimals(6); self.sb_scale.setValue(0.0)
         self.sb_scale.setToolTip("Micrometers per pixel. If 0, will try to read from TIFF metadata.")
+        self.sb_scale.valueChanged.connect(self.on_scale_changed)
+
         self.cb_autoscale = QPushButton("Read scale from metadata"); self.cb_autoscale.setToolTip("Attempt to read µm/px from TIFF tags (PixelWidth or HFW/ResolutionX).")
         self.cb_autoscale.clicked.connect(self.read_scale_meta)
 
@@ -567,6 +572,20 @@ class MainWindow(QWidget):
 
         mode_row = QWidget(); hl = QHBoxLayout(mode_row); hl.setContentsMargins(0,0,0,0); hl.addWidget(self.cb_mode); hl.addWidget(self.btn_help)
         form.addRow("Scale (µm/px)", self.sb_scale); form.addRow(" ", self.cb_autoscale); form.addRow("Analysis mode", mode_row)
+
+        # --- Auto/Manual display units controls ---
+        self.cb_auto_units = QCheckBox("Auto-detect display units from scale")
+        self.cb_auto_units.setChecked(True)
+        self.cb_auto_units.setToolTip("When enabled: display units (µm/nm) are chosen automatically from the scale (µm/px). Manual selection is disabled.")
+        self.cb_auto_units.toggled.connect(self.on_auto_units_toggled)
+        form.addRow(self.cb_auto_units)
+
+        self.cb_units = QComboBox()
+        self.cb_units.addItems(["µm", "nm"])
+        self.cb_units.setToolTip("Display units for plots/table/stats/CSV (works if auto-detect is disabled).")
+        self.cb_units.currentIndexChanged.connect(self.on_units_changed)
+        self.cb_units.setEnabled(False)  # start locked because auto=on
+        form.addRow("Display units", self.cb_units)
 
         # ROI
         self.sb_top = QDoubleSpinBox(); self.sb_bottom = QDoubleSpinBox(); self.sb_left = QDoubleSpinBox(); self.sb_right = QDoubleSpinBox()
@@ -687,14 +706,12 @@ class MainWindow(QWidget):
 
     # ---------- Hotkeys ----------
     def add_actions(self):
-        # ЄДИНИЙ шорткат відкриття — стандартний Open (Ctrl+O / Cmd+O), ApplicationShortcut
         self.act_open_global = QAction(self)
         self.act_open_global.setShortcut(QKeySequence(QKeySequence.Open))
         self.act_open_global.setShortcutContext(Qt.ApplicationShortcut)
         self.act_open_global.triggered.connect(self.open_image)
         self.addAction(self.act_open_global)
 
-        # Інші хоткеї
         self.act_run = QAction(self, triggered=self.run_analysis)
         self.act_run.setShortcut(QKeySequence("Ctrl+R"))
         self.act_run.setShortcutContext(Qt.ApplicationShortcut)
@@ -740,6 +757,62 @@ class MainWindow(QWidget):
         self.grp_thr.setVisible(not is_log)
         self.tabs.setTabEnabled(self.tabs.indexOf(self.view_thresh), not is_log)
 
+    # ---------- Unit helpers ----------
+    def unit_label(self) -> str:
+        return "nm" if self.cb_units.currentIndex() == 1 else "µm"
+
+    def unit_factor(self) -> float:
+        return 1000.0 if self.unit_label() == "nm" else 1.0  # µm -> chosen unit
+
+    def scale_stats_for_display(self, st: dict) -> dict:
+        if not st:
+            return {}
+        out = dict(st)
+        factor = self.unit_factor()
+        for k in ("D10","D50","D90","mean","std","min","max"):
+            if k in out:
+                out[k] = float(out[k]) * factor
+        return out
+
+    def decide_units_from_scale(self, scale_um_per_px: float | None) -> str:
+        if scale_um_per_px is None or scale_um_per_px <= 0:
+            return self.unit_label()
+        return "nm" if scale_um_per_px < self.auto_nm_threshold_um_per_px else "µm"
+
+    def set_display_unit(self, unit: str):
+        target_idx = 1 if unit == "nm" else 0
+        if self.cb_units.currentIndex() != target_idx:
+            self.cb_units.blockSignals(True)
+            self.cb_units.setCurrentIndex(target_idx)
+            self.cb_units.blockSignals(False)
+
+    def update_units_lock(self):
+        self.cb_units.setEnabled(not self.cb_auto_units.isChecked())
+
+    def maybe_update_auto_units(self):
+        if not self.cb_auto_units.isChecked():
+            return
+        scale = self.sb_scale.value()
+        if (not scale or scale <= 0) and self.um_per_px_from_meta:
+            scale = self.um_per_px_from_meta
+        unit = self.decide_units_from_scale(scale)
+        self.set_display_unit(unit)
+        self.render_previews()
+        self.update_stats_table()
+
+    def on_auto_units_toggled(self, on: bool):
+        self.update_units_lock()
+        if on:
+            self.maybe_update_auto_units()
+
+    def on_scale_changed(self, *_):
+        self.maybe_update_auto_units()
+
+    def on_units_changed(self, *_):
+        # manual change -> just re-render
+        self.render_previews()
+        self.update_stats_table()
+
     # ---------- File open helpers ----------
     def _open_path(self, p: Path):
         self.image_path = p
@@ -754,6 +827,8 @@ class MainWindow(QWidget):
             self.meta_label.setText(f"Scale: from meta {self.um_per_px_from_meta:.6f} µm/px (also set in control)")
         else:
             self.meta_label.setText("Scale: — (set µm/px or read metadata)")
+        self.maybe_update_auto_units()
+
         self.view_original.set_image(cv2.cvtColor(self.gray, cv2.COLOR_GRAY2BGR))
         self.tabs.setCurrentWidget(self.view_original)
         self._show_tabs(True)
@@ -788,6 +863,7 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "Meta", "No usable TIFF metadata found."); return
         self.um_per_px_from_meta = val; self.sb_scale.setValue(round(val, 6))
         self.meta_label.setText(f"Scale: from meta {val:.6f} µm/px (also set in control)")
+        self.maybe_update_auto_units()
 
     def current_params(self) -> Params:
         scale = self.sb_scale.value()
@@ -831,6 +907,7 @@ class MainWindow(QWidget):
             if not bad_scale(meta_val):
                 self.sb_scale.setValue(round(meta_val, 6))
                 P.scale_um_per_px = meta_val
+                self.maybe_update_auto_units()
                 QMessageBox.information(self, "Auto-tune", f"Scale was invalid. Using scale from metadata: {meta_val:.6f} µm/px")
             else:
                 QMessageBox.warning(self, "Auto-tune", "Scale (µm/px) is invalid and no usable value found in metadata.\nPlease set a proper scale manually.")
@@ -907,6 +984,9 @@ class MainWindow(QWidget):
             f"Parameters updated for the current mode."
         )
 
+        # If auto-units is enabled, ensure units reflect current scale
+        self.maybe_update_auto_units()
+
     # ---------- Run ----------
     def run_analysis(self):
         if self.gray is None or self.image_path is None:
@@ -979,8 +1059,14 @@ class MainWindow(QWidget):
             self.view_thresh.set_image(thr_to_show)
         if self.overlay_img is not None:
             self.view_overlay.set_image(self.overlay_img)
-        self.plot_hist.plot_hist(self.diams_um, self.stats, "PSD Histogram")
-        self.plot_cum.plot_cum(self.diams_um, self.stats)
+
+        factor = self.unit_factor()
+        unit = self.unit_label()
+        d_disp = self.diams_um * factor
+        st_disp = self.scale_stats_for_display(self.stats)
+
+        self.plot_hist.plot_hist(d_disp, st_disp, "PSD Histogram", unit)
+        self.plot_cum.plot_cum(d_disp, st_disp, unit)
 
     def update_stats_table(self):
         rows: list[tuple[float, bool]] = []
@@ -988,14 +1074,22 @@ class MainWindow(QWidget):
             if i not in self.excluded_idx: rows.append((d, False))
         for i, (_cnt, d, _c) in enumerate(self.results):
             if i in self.excluded_idx: rows.append((d, True))
+
+        unit = self.unit_label()
+        factor = self.unit_factor()
+        self.table.setHorizontalHeaderLabels([f"diameter ({unit})"])
+
         if rows:
-            st = self.stats
+            st = self.scale_stats_for_display(self.stats)
             self.stats_label.setText(
-                f"Particles: {st['particles']} | D10={st['D10']:.3f} µm | D50={st['D50']:.3f} µm | "
-                f"D90={st['D90']:.3f} µm | mean={st['mean']:.3f} µm | std={st['std']:.3f} µm"
+                f"Particles: {self.stats.get('particles', 0)} | "
+                f"D10={st['D10']:.3f} {unit} | D50={st['D50']:.3f} {unit} | "
+                f"D90={st['D90']:.3f} {unit} | mean={st['mean']:.3f} {unit} | "
+                f"std={st['std']:.3f} {unit}"
             )
             self.table.setRowCount(len(rows))
-            for i, (v, excl) in enumerate(rows):
+            for i, (v_um, excl) in enumerate(rows):
+                v = v_um * factor
                 cell = QTableWidgetItem(f"{v:.6f}")
                 if excl:
                     cell.setForeground(Qt.gray); f = cell.font(); f.setItalic(True); cell.setFont(f)
@@ -1010,12 +1104,19 @@ class MainWindow(QWidget):
         active = [d for i, (_c, d, _ci) in enumerate(self.results) if i not in self.excluded_idx]
         if not active:
             QMessageBox.information(self, "CSV", "No active particles to export."); return
-        path, _ = QFileDialog.getSaveFileName(self, "Save diameters CSV", "diameters.csv", "CSV (*.csv)")
+
+        unit = self.unit_label()
+        factor = self.unit_factor()
+
+        path, _ = QFileDialog.getSaveFileName(self, "Save diameters CSV", f"diameters_{unit}.csv", "CSV (*.csv)")
         if not path: return
         try:
             with open(path, "w", newline="") as f:
-                w = csv.writer(f); w.writerow(["diameter_um"])
-                for d in active: w.writerow([f"{d:.6f}"])
+                w = csv.writer(f)
+                col = f"diameter_{'nm' if unit=='nm' else 'um'}"
+                w.writerow([col])
+                for d_um in active:
+                    w.writerow([f"{d_um * factor:.6f}"])
         except Exception as e:
             QMessageBox.critical(self, "CSV", f"Failed to save: {e}")
 
