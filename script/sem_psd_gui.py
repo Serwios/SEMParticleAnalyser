@@ -17,7 +17,7 @@ from PIL import Image
 from PySide6.QtCore import (
     Qt, Signal, QObject, QThread, QEvent, QStandardPaths, QSettings, QRect
 )
-from PySide6.QtGui import QPixmap, QAction, QTransform, QPainter, QImage, QKeySequence
+from PySide6.QtGui import QPixmap, QAction, QTransform, QPainter, QImage, QKeySequence, QAction, QIcon
 from PySide6.QtWidgets import (
     QApplication, QWidget, QFileDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QFormLayout, QDoubleSpinBox, QSpinBox, QTabWidget, QComboBox, QCheckBox,
@@ -241,6 +241,8 @@ class MainWindow(QWidget):
 
     def __init__(self):
         super().__init__()
+        self.setWindowIcon(QIcon(str(Path(__file__).resolve().parent.parent / "res" / "app_icon.ico")))
+
         self.setWindowTitle("SEM PSD (Particles Analysis)")
         self.resize(1500, 900)
 
@@ -1433,9 +1435,11 @@ class MainWindow(QWidget):
 def main():
     app = QApplication(sys.argv)
     app.setStyle(ToolTipDelayStyle(app.style()))
+    app.setWindowIcon(QIcon(str(Path(__file__).resolve().parent / "assets" / "app_icon.png")))
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()
