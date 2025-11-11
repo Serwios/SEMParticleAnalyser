@@ -1,3 +1,13 @@
+"""
+SEM PSD — Particle Size Analysis GUI
+
+GUI to estimate particle size distributions (PSD) from SEM images.
+Modes: Contours (threshold+morphology, optional watershed) and Nano (multi-scale LoG).
+
+Features: scale from TIFF, overlay with labels, histogram & cumulative (D10/D50/D90, mean, std),
+extended metrics (Feret, circularity, AR, roundness, solidity), ISO 9276 D₃,₂/D₄,₃, bootstrap 95% CI.
+"""
+
 from __future__ import annotations
 
 import csv
@@ -45,12 +55,11 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
 
-        # Іконка з кореня проєкту: SEMParticleAnalyser/res/app_icon.ico
         icon_path = Path(__file__).resolve().parents[2] / "res" / "app_icon.ico"
         if icon_path.exists():
             icon = QIcon(str(icon_path))
-            self.setWindowIcon(icon)                     # ← для заголовка вікна
-            QApplication.instance().setWindowIcon(icon)  # ← для таскбару
+            self.setWindowIcon(icon)
+            QApplication.instance().setWindowIcon(icon)
         else:
             print(f"[icon] not found: {icon_path}")
         self.setWindowTitle("SEM PSD (Particles Analysis)")
@@ -93,7 +102,6 @@ class MainWindow(QWidget):
         self.weighted_stats = {}
         self.boot_ci = {}
 
-        # NEW: чи вже був запуск аналізу (щоб не показувати «плейсхолдер» на старті)
         self._ever_ran = False
 
         self.build_ui()
@@ -1065,7 +1073,6 @@ class MainWindow(QWidget):
                 f"std={st.get('std', 0):.3f} {unit}"
             )
         else:
-            # якщо аналіз ще не запускався — чисто
             if not self._ever_ran:
                 self.stats_label.setText("—")
                 self.table.setRowCount(0)
@@ -1073,7 +1080,6 @@ class MainWindow(QWidget):
                 return
             self.stats_label.setText("No particles accepted. Adjust parameters.")
 
-        # наповнення
         self.table.setSortingEnabled(False)
         if rows:
             self.table.setRowCount(len(rows))
@@ -1299,7 +1305,7 @@ class MainWindow(QWidget):
         if busy:
             self.btn_cancel.setEnabled(True)
             self.elapsed_label.setProperty("canceling", "false")
-            self.elapsed_label.style().unpolish(self.elapsed_label);
+            self.elapsed_label.style().unpolish(self.elapsed_label)
             self.elapsed_label.style().polish(self.elapsed_label)
             self._elapsed.restart()
             self._tick_elapsed()
@@ -1314,7 +1320,7 @@ class MainWindow(QWidget):
         if busy:
             self._is_canceling = False
             self.elapsed_label.setProperty("canceling", "false")
-            self.elapsed_label.style().unpolish(self.elapsed_label);
+            self.elapsed_label.style().unpolish(self.elapsed_label)
             self.elapsed_label.style().polish(self.elapsed_label)
             self._elapsed.start()
             self._tick_elapsed()
@@ -1334,9 +1340,8 @@ class MainWindow(QWidget):
         n = len(self.results)
         val, ok = QInputDialog.getInt(self, "Find particle", "Index (1..N):", 1, 1, n, 1)
         if not ok: return
-        ridx = val - 1  # 0-based індекс у self.results
+        ridx = val - 1
 
-        # знайти відповідний рядок у поточному порядку
         try:
             row = self.row_to_result.index(ridx)
         except ValueError:
@@ -1374,7 +1379,7 @@ class MainWindow(QWidget):
     def on_cancel_clicked(self):
         self.btn_cancel.setEnabled(False)
         self.elapsed_label.setProperty("canceling", "true")
-        self.elapsed_label.style().unpolish(self.elapsed_label);
+        self.elapsed_label.style().unpolish(self.elapsed_label)
         self.elapsed_label.style().polish(self.elapsed_label)
 
         if self._thread and self._thread.isRunning():
