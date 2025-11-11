@@ -19,23 +19,20 @@ from PySide6.QtWidgets import (
     QInputDialog, QAbstractItemView
 )
 
-from .image_view import ImageView
-from .mpl_widget import MplWidget
-# ---- local modules (винесені) ----
-from .utils import NumericItem
-from .worker import Worker
-# +++ add-ons
-from ..addons import (
-    resolve_scale_xy, enrich_results, iso9276_weighted_means,
+from sem_psd.gui.image_view import ImageView
+from sem_psd.gui.mpl_widget import MplWidget
+
+from sem_psd.gui.utils import NumericItem
+from sem_psd.gui.worker import Worker
+
+from sem_psd.addons import (
+    enrich_results, iso9276_weighted_means,
     bootstrap_ci_percentile, bootstrap_ci_mean, write_csv_extended
 )
-# ---- import core ----
-from ..core import (
+
+from sem_psd.core import (
     imread_gray, scale_from_metadata,
-    make_roi_mask, preprocess, threshold_pair,
-    morph_open, morph_close, fill_small_holes,
-    split_touching_watershed, count_reasonable_components, measure_components,
-    stats_from_diams, detect_blobs_log, Params,
+    stats_from_diams, Params,
 )
 
 class MainWindow(QWidget):

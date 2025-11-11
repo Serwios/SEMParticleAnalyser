@@ -2,7 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 import numpy as np
 from PySide6.QtCore import QObject, Signal, QThread
-from ..core import (
+from sem_psd.core import (
     make_roi_mask, preprocess, threshold_pair, morph_open, morph_close, fill_small_holes,
     split_touching_watershed, count_reasonable_components, measure_components,
     detect_blobs_log, Params,
@@ -17,12 +17,12 @@ class Worker(QObject):
         self.gray = gray
         self.P = params
         self.image_path = image_path
-        self._cancelled = False  # ← NEW
+        self._cancelled = False
 
-    def cancel(self):           # ← NEW
+    def cancel(self):
         self._cancelled = True
 
-    def _canceled(self) -> bool:  # ← NEW
+    def _canceled(self) -> bool:
         th = QThread.currentThread()
         return self._cancelled or (th and th.isInterruptionRequested())
 

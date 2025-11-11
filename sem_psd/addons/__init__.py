@@ -11,14 +11,14 @@ Provides helper functions for:
 """
 
 # ---- Scale / tilt utilities ----
-from .scale_tilt import (
+from sem_psd.addons.scale_tilt import (
     resolve_scale_xy,
     effective_um_per_px_for_isotropic_kernels,
     tilt_corr_factor,
 )
 
 # ---- Geometry helpers ----
-from .geometry import (
+from sem_psd.addons.geometry import (
     contour_px_to_um,
     perimeter_um,
     feret_diameters_um,
@@ -26,17 +26,17 @@ from .geometry import (
 )
 
 # ---- Extended metrics ----
-from .metrics import extended_metrics
+from sem_psd.addons.metrics import extended_metrics
 
 # ---- ISO 9276 weighted stats ----
-from .iso_stats import iso9276_weighted_means
+from sem_psd.addons.iso_stats import iso9276_weighted_means
 
 # ---- Bootstrap confidence intervals ----
-from .bootstrap import bootstrap_ci_percentile, bootstrap_ci_mean
+from sem_psd.addons.bootstrap import bootstrap_ci_percentile, bootstrap_ci_mean
 
 # ---- Result enrichment / CSV export ----
-from .enrich import ParticleRow, enrich_results
-from .csv_ext import write_csv_extended
+from sem_psd.addons.enrich import ParticleRow, enrich_results
+from sem_psd.addons.csv_ext import write_csv_extended
 
 
 __all__ = [

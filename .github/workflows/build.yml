@@ -70,7 +70,7 @@ jobs:
             --add-data "res/app_icon.ico;res" `
             --add-data "samples/blobs.tif;samples" `
             --add-data "samples/granular.tif;samples" `
-            sem_psd\gui\app.py
+            launcher.py
 
       - name: Package zip
         id: pack

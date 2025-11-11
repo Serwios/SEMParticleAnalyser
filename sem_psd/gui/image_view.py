@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QSizePolicy
 )
 
-from .utils import np_to_qpix
+from sem_psd.gui.utils import np_to_qpix
 
 
 class ImageView(QGraphicsView):

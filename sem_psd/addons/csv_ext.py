@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import List
 import csv
 
-from .enrich import ParticleRow
+from sem_psd.addons.enrich import ParticleRow
 
 
 def write_csv_extended(path: str, particles: List[ParticleRow], unit: str = "µm") -> None:

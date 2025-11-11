@@ -11,13 +11,13 @@ import math
 import numpy as np
 import cv2
 
-from .geometry import (
+from sem_psd.addons.geometry import (
     contour_px_to_um,
     perimeter_um,
     feret_diameters_um,
     ellipse_axes_um,
 )
-from .scale_tilt import tilt_corr_factor
+from sem_psd.addons.scale_tilt import tilt_corr_factor
 
 
 def extended_metrics(cnt_px, umx: float, umy: float, tilt_deg: float = 0.0):

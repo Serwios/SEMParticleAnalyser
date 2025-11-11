@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import List, Tuple
 import numpy as np
 
-from .metrics import extended_metrics
+from sem_psd.addons.metrics import extended_metrics
 
 
 @dataclass
