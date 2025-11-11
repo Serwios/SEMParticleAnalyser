@@ -2,7 +2,8 @@
 **SEM Particle Analyser (or SEM-PSD)** is a desktop application for **particle size distribution (PSD) analysis** of scanning electron microscopy (SEM) images.  It provides a reproducible, interactive, and user-friendly workflow for extracting particle statistics from high-resolution microscopy data.
 
 ---
-
+<img width="1703" height="1089" alt="image" src="https://github.com/user-attachments/assets/102abf0b-b44c-405b-9ac1-e09578a34ed6" />
+---
 ## ✨ Key Features
 
 - **Wide image support**  
