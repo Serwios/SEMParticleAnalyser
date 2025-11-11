@@ -11,7 +11,6 @@ jobs:
     runs-on: windows-latest
 
     env:
-      # базова назва продукту (для exe/zip)
       APP_NAME: SEM-PSD
 
     steps:
@@ -25,14 +24,15 @@ jobs:
 
       - name: Compute version
         id: ver
-        shell: bash
+        shell: pwsh
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/}"
-          else
-            VERSION="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
-          fi
-          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $version = $env:GITHUB_REF.Replace('refs/tags/','')
+          } else {
+            $short = $env:GITHUB_SHA.Substring(0,7)
+            $version = "$(Get-Date -AsUTC -Format yyyyMMdd)-$short"
+          }
+          "VERSION=$version" >> $env:GITHUB_OUTPUT
 
       - name: Show version
         run: echo Version = ${{ steps.ver.outputs.VERSION }}
@@ -42,38 +42,46 @@ jobs:
         with:
           path: |
             ~\AppData\Local\pip\Cache
-          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml', 'requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
       - name: Install build deps
+        shell: pwsh
         run: |
           python -m pip install -U pip wheel
-          REM мінімальний набір залежностей для програми
-          pip install pyinstaller PySide6 numpy opencv-python matplotlib
+          # Мінімальний набір залежностей для збірки
+          if (Test-Path 'requirements.txt') {
+            pip install -r requirements.txt
+          } else {
+            pip install pyinstaller PySide6 numpy opencv-python matplotlib
+          }
 
       - name: Build with PyInstaller
+        shell: pwsh
         run: |
-          setlocal EnableDelayedExpansion
-          set VERSION=${{ steps.ver.outputs.VERSION }}
-          pyinstaller ^
-            --noconfirm --clean --windowed ^
-            --name "%APP_NAME%-%VERSION%" ^
-            --icon "res/app_icon.ico" ^
-            --add-data "res/app_icon.ico;res" ^
-            --add-data "samples/blobs.tif;samples" ^
-            --add-data "samples/granular.tif;samples" ^
+          $version = "${{ steps.ver.outputs.VERSION }}"
+          $name = "$env:APP_NAME-$version"
+
+          pyinstaller `
+            --noconfirm --clean --windowed `
+            --name "$name" `
+            --icon "res/app_icon.ico" `
+            --add-data "res/app_icon.ico;res" `
+            --add-data "samples/blobs.tif;samples" `
+            --add-data "samples/granular.tif;samples" `
             sem_psd\gui\app.py
 
       - name: Package zip
+        id: pack
+        shell: pwsh
         run: |
           $ver = "${{ steps.ver.outputs.VERSION }}"
-          $name = "${{ env.APP_NAME }}-$ver"
+          $name = "$env:APP_NAME-$ver"
           $src  = "dist\$name"
           $zip  = "$name-win64.zip"
           Compress-Archive -Path "$src\*" -DestinationPath "$zip"
-          echo "ZIP_NAME=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-        id: pack
+          "ZIP_NAME=$zip" >> $env:GITHUB_OUTPUT
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
