@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=69", "setuptools_scm[toml]>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sem-psd"
+dynamic = ["version"]
+requires-python = ">=3.11"
+dependencies = [
+  "PySide6>=6.6",
+  "numpy",
+  "opencv-python-headless",
+  "matplotlib",
+]
+
+[tool.setuptools_scm]
+
+write_to = "sem_psd/_version.py"
+version_scheme = "guess-next-dev"
+local_scheme = "node-and-date"

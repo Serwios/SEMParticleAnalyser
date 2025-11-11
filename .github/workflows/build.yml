@@ -1,0 +1,93 @@
+name: build-windows
+
+on:
+  push:
+    branches: [ main ]
+    tags:     [ 'v*' ]
+  pull_request:
+
+jobs:
+  win-build:
+    runs-on: windows-latest
+
+    env:
+      # базова назва продукту (для exe/zip)
+      APP_NAME: SEM-PSD
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compute version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          fi
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Show version
+        run: echo Version = ${{ steps.ver.outputs.VERSION }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\pip\Cache
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install build deps
+        run: |
+          python -m pip install -U pip wheel
+          REM мінімальний набір залежностей для програми
+          pip install pyinstaller PySide6 numpy opencv-python matplotlib
+
+      - name: Build with PyInstaller
+        run: |
+          setlocal EnableDelayedExpansion
+          set VERSION=${{ steps.ver.outputs.VERSION }}
+          pyinstaller ^
+            --noconfirm --clean --windowed ^
+            --name "%APP_NAME%-%VERSION%" ^
+            --icon "res/app_icon.ico" ^
+            --add-data "res/app_icon.ico;res" ^
+            --add-data "samples/blobs.tif;samples" ^
+            --add-data "samples/granular.tif;samples" ^
+            sem_psd\gui\app.py
+
+      - name: Package zip
+        run: |
+          $ver = "${{ steps.ver.outputs.VERSION }}"
+          $name = "${{ env.APP_NAME }}-$ver"
+          $src  = "dist\$name"
+          $zip  = "$name-win64.zip"
+          Compress-Archive -Path "$src\*" -DestinationPath "$zip"
+          echo "ZIP_NAME=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        id: pack
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ steps.ver.outputs.VERSION }}-win64
+          path: ${{ steps.pack.outputs.ZIP_NAME }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pack.outputs.ZIP_NAME }}
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
