@@ -7,6 +7,101 @@ on:
   pull_request:
 
 jobs:
+  mac-build:
+    runs-on: macos-14
+    env:
+      APP_NAME: SEM-PSD
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compute version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/}"
+          else
+            short="${GITHUB_SHA::7}"
+            version="$(date -u +%Y%m%d)-$short"
+          fi
+          echo "VERSION=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Show version
+        run: echo "Version = ${{ steps.ver.outputs.VERSION }}"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml', 'requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install build deps
+        shell: bash
+        run: |
+          python -m pip install -U pip wheel
+          if [[ -f requirements.txt ]]; then
+            pip install -r requirements.txt
+          else
+            pip install pyinstaller PySide6 numpy opencv-python matplotlib
+          fi
+
+      - name: Build with PyInstaller (arm64)
+        shell: bash
+        run: |
+          version="${{ steps.ver.outputs.VERSION }}"
+          name="$APP_NAME-$version"
+          ICON_OPT=""
+          if [[ -f "res/app_icon.icns" ]]; then
+            ICON_OPT="--icon res/app_icon.icns"
+          fi
+
+          # NOTE: on macOS use ":" in --add-data
+          pyinstaller \
+            --noconfirm --clean --windowed \
+            --name "$name" \
+            $ICON_OPT \
+            --add-data "res/app_icon.ico:res" \
+            --add-data "samples/blobs.tif:samples" \
+            --add-data "samples/granular.tif:samples" \
+            launcher.py
+
+      - name: Package ZIP
+        id: pack
+        shell: bash
+        run: |
+          ver="${{ steps.ver.outputs.VERSION }}"
+          name="$APP_NAME-$ver"
+          app="dist/$name.app"
+          zip_name="$name-macOS-arm64.zip"
+          # Preserve resource forks/metadata with ditto
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$zip_name"
+          echo "ZIP_NAME=$zip_name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ steps.ver.outputs.VERSION }}-macOS-arm64
+          path: ${{ steps.pack.outputs.ZIP_NAME }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pack.outputs.ZIP_NAME }}
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+
   win-build:
     runs-on: windows-latest
 
