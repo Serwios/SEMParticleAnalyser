@@ -1,6 +1,5 @@
-# SEM Particle Analyser (NanoScope PSD)
-
-**SEM Particle Analyser (NanoScope PSD)** is a desktop application for **particle size distribution (PSD) analysis** of scanning electron microscopy (SEM) images.  
+# SEM Particle Analyser
+**SEM Particle Analyser (or SEM-PSD)** is a desktop application for **particle size distribution (PSD) analysis** of scanning electron microscopy (SEM) images.  
 It provides a reproducible, interactive, and user-friendly workflow for extracting particle statistics from high-resolution microscopy data.
 
 ---
