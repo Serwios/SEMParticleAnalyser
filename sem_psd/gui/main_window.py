@@ -1,236 +1,42 @@
-# sem_psd_gui.py
-# SEM particle-size GUI (PySide6) with:
-# - right "Results" bar (user-selectable outputs),
-# - extended metrics & ISO/CI (requires sem_psd_addons.py),
-# - sortable tables, horizontal scroll & tooltips,
-# - Welcome screen (drop target),
-# - exclusions ("Remove blobs") affect all results & exports.
-
 from __future__ import annotations
-import sys, math, csv, textwrap
+
+import csv
+import textwrap
 from pathlib import Path
 
-import numpy as np
 import cv2
-from PIL import Image
-
+import numpy as np
 from PySide6.QtCore import (
-    Qt, Signal, QObject, QThread, QEvent, QStandardPaths, QSettings, QRect
+    Qt, QThread, QEvent, QStandardPaths, QSettings, QRect, QElapsedTimer, QTimer
 )
-from PySide6.QtGui import QPixmap, QAction, QTransform, QPainter, QImage, QKeySequence, QAction, QIcon
+from PySide6.QtGui import QAction, QImage, QKeySequence, QIcon
 from PySide6.QtWidgets import (
     QApplication, QWidget, QFileDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QFormLayout, QDoubleSpinBox, QSpinBox, QTabWidget, QComboBox, QCheckBox,
     QMessageBox, QSplitter, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy,
-    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QProgressBar, QGroupBox,
-    QProxyStyle, QStyle, QToolButton, QMenu, QStackedWidget, QFrame,
+    QProgressBar, QGroupBox,
+    QToolButton, QMenu, QStackedWidget, QFrame,
     QInputDialog, QAbstractItemView
 )
 
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
-
-# ---- import core ----
-from sem_psd_core import (
-    imread_gray, scale_from_metadata,
-    make_roi_mask, preprocess, threshold_pair, morph_open, morph_close, fill_small_holes,
-    split_touching_watershed, count_reasonable_components, measure_components,
-    stats_from_diams, detect_blobs_log, Params
-)
-
-# +++ NEW: add-ons
-from sem_psd_addons import (
+from .image_view import ImageView
+from .mpl_widget import MplWidget
+# ---- local modules (винесені) ----
+from .utils import NumericItem
+from .worker import Worker
+# +++ add-ons
+from ..addons import (
     resolve_scale_xy, enrich_results, iso9276_weighted_means,
     bootstrap_ci_percentile, bootstrap_ci_mean, write_csv_extended
 )
-
-# --- Numeric QTableWidgetItem: коректне сортування чисел і тултіп з повним значенням
-class NumericItem(QTableWidgetItem):
-    def __init__(self, value, fmt="{:.6f}"):
-        if isinstance(value, (int, float, np.floating)):
-            txt = fmt.format(float(value))
-            super().__init__(txt)
-            self._num = float(value)
-        else:
-            super().__init__(str(value))
-            self._num = None
-        self.setToolTip(self.text())
-
-    def __lt__(self, other):
-        if isinstance(other, QTableWidgetItem) and self.column() == other.column():
-            a = self._num
-            b = getattr(other, "_num", None)
-            if a is not None and b is not None:
-                return a < b
-        return super().__lt__(other)
-
-# ---------------- GUI helpers ----------------
-
-def np_to_qpix(img: np.ndarray) -> QPixmap:
-    if img.ndim == 2:
-        qimg = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    else:
-        qimg = img
-    h, w, _ = qimg.shape
-    qimg = cv2.cvtColor(qimg, cv2.COLOR_BGR2RGB)
-    qim = QImage(qimg.data, w, h, 3 * w, QImage.Format_RGB888)
-    return QPixmap.fromImage(qim)
-
-# ---------------- LoG/Threshold worker ----------------
-
-class Worker(QObject):
-    finished = Signal(object)
-    failed = Signal(object)
-    def __init__(self, gray: np.ndarray, params: Params, image_path: Path):
-        super().__init__(); self.gray = gray; self.P = params; self.image_path = image_path
-
-    def run(self):
-        try:
-            roi_mask = make_roi_mask(self.gray.shape, self.P.exclude_top, self.P.exclude_bottom, self.P.exclude_left, self.P.exclude_right)
-            scale = self.P.scale_um_per_px or 0.0
-            if scale <= 0:
-                raise ValueError("Scale (µm/px) is required.")
-            lev = preprocess(self.gray, self.P.clahe_clip, self.P.tophat_um, scale, self.P.level_strength)
-
-            if self.P.analysis_mode == "log":
-                results = detect_blobs_log(self.gray, lev, scale,
-                                           self.P.min_d_um, self.P.max_d_um,
-                                           self.P.log_threshold_rel, self.P.log_minsep_um,
-                                           roi_mask, self.P.min_rel_contrast)
-                self.finished.emit({"lev": lev, "thr_raw": None, "thr_proc": None, "results": results}); return
-
-            bwB, bwD = threshold_pair(lev, roi_mask, method=self.P.thr_method, block_size=self.P.block_size, C=self.P.block_C)
-            kB = count_reasonable_components(bwB, scale, self.P.min_d_um, self.P.max_d_um)
-            kD = count_reasonable_components(bwD, scale, self.P.min_d_um, self.P.max_d_um)
-            bw = bwB if kB >= kD else bwD; thr_raw = bw.copy()
-            bw = morph_close(bw, self.P.closing_um, scale)
-            bw = morph_open(bw, self.P.open_um, scale)
-            bw = fill_small_holes(bw, 0.6)
-            if self.P.split_touching:
-                bw = split_touching_watershed(bw, scale, self.P.min_neck_um, self.P.min_seg_d_um)
-            results = measure_components(bw, self.P.min_d_um, self.P.max_d_um, self.P.min_circ, scale, lev, self.P.min_rel_contrast)
-            self.finished.emit({"lev": lev, "thr_raw": thr_raw, "thr_proc": bw, "results": results})
-        except Exception as e:
-            self.failed.emit(str(e))
-
-# ---------------- Tiny plotting widget ----------------
-
-class MplWidget(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.fig = Figure(figsize=(5, 4))
-        self.canvas = FigureCanvas(self.fig)
-        layout = QVBoxLayout(self); layout.setContentsMargins(0, 0, 0, 0); layout.addWidget(self.canvas)
-
-    def plot_hist(self, d_vals: np.ndarray, st: dict, title: str, unit: str):
-        self.fig.clear(); ax = self.fig.add_subplot(111)
-        if d_vals.size:
-            ax.hist(d_vals, bins=40)
-            for name in ("D10","D50","D90"):
-                ax.axvline(st.get(name, 0.0), linestyle="--", label=f"{name}={st.get(name,0):.2f} {unit}")
-            ax.set_xlabel(f"Particle diameter ({unit})"); ax.set_ylabel("Count"); ax.set_title(title)
-            ax.grid(True); ax.legend()
-        self.canvas.draw()
-
-    def plot_cum(self, d_vals: np.ndarray, st: dict, unit: str):
-        self.fig.clear(); ax = self.fig.add_subplot(111)
-        if d_vals.size:
-            s = np.sort(d_vals); cum = np.arange(1, s.size+1)/s.size*100.0
-            ax.plot(s, cum)
-            for name in ("D10","D50","D90"):
-                ax.axvline(st.get(name, 0.0), linestyle="--", label=f"{name}={st.get(name,0):.2f} {unit}")
-            ax.set_xlabel(f"Particle diameter ({unit})"); ax.set_ylabel("Cumulative %"); ax.set_title("Cumulative PSD")
-            ax.grid(True); ax.legend()
-        self.canvas.draw()
-
-# ---------------- Image view ----------------
-
-class ImageView(QGraphicsView):
-    sig_clicked = Signal(int, int)
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setScene(QGraphicsScene(self))
-        self._item = QGraphicsPixmapItem()
-        self.scene().addItem(self._item)
-        self._img_w = 0
-        self._img_h = 0
-        self._auto_fit = True
-
-        self.setRenderHints(self.renderHints() | QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
-        self.setDragMode(QGraphicsView.ScrollHandDrag)
-        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
-        self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setFrameShape(QGraphicsView.NoFrame)
-
-    def set_image(self, np_img: np.ndarray | QPixmap):
-        pm = np_img if isinstance(np_img, QPixmap) else np_to_qpix(np_img)
-        self._item.setPixmap(pm)
-        self._img_w = pm.width()
-        self._img_h = pm.height()
-        self._auto_fit = True
-        self.fit_to_view()
-
-    def fit_to_view(self):
-        if self._img_w == 0 or self.width() < 5 or self.height() < 5:
-            return
-        self.setTransform(QTransform())
-        r = self._item.boundingRect()
-        m = 2
-        self.fitInView(r.adjusted(m, m, -m, -m), Qt.KeepAspectRatio)
-
-    def resizeEvent(self, e):
-        if self._auto_fit and self._img_w:
-            self.fit_to_view()
-        super().resizeEvent(e)
-
-    def wheelEvent(self, e):
-        if self._img_w == 0:
-            return
-        self._auto_fit = False
-        factor = 1.15 if e.angleDelta().y() > 0 else 1/1.15
-        self.scale(factor, factor)
-
-    def mouseDoubleClickEvent(self, e):
-        self._auto_fit = True
-        self.fit_to_view()
-        super().mouseDoubleClickEvent(e)
-
-    def keyPressEvent(self, e):
-        if e.modifiers() & Qt.ControlModifier:
-            if e.key() == Qt.Key_1:
-                self._auto_fit = False
-                self.setTransform(QTransform())
-                e.accept(); return
-            if e.key() == Qt.Key_0:
-                self._auto_fit = True
-                self.fit_to_view()
-                e.accept(); return
-            if e.key() == Qt.Key_Plus:
-                self._auto_fit = False; self.scale(1.15, 1.15); e.accept(); return
-            if e.key() == Qt.Key_Minus:
-                self._auto_fit = False; self.scale(1/1.15, 1/1.15); e.accept(); return
-        super().keyPressEvent(e)
-
-    def mousePressEvent(self, e):
-        if self._img_w:
-            p = self.mapToScene(e.pos())
-            x = int(round(p.x()))
-            y = int(round(p.y()))
-            x = max(0, min(self._img_w - 1, x))
-            y = max(0, min(self._img_h - 1, y))
-            self.sig_clicked.emit(x, y)
-        super().mousePressEvent(e)
-
-class ToolTipDelayStyle(QProxyStyle):
-    def styleHint(self, hint, option=None, widget=None, returnData=None):
-        if hint == QStyle.SH_ToolTip_WakeUpDelay:
-            return 5000
-        if hint == QStyle.SH_ToolTip_FallAsleepDelay:
-            return 30000
-        return super().styleHint(hint, option, widget, returnData)
-
-# ---------------- Main Window ----------------
+# ---- import core ----
+from ..core import (
+    imread_gray, scale_from_metadata,
+    make_roi_mask, preprocess, threshold_pair,
+    morph_open, morph_close, fill_small_holes,
+    split_touching_watershed, count_reasonable_components, measure_components,
+    stats_from_diams, detect_blobs_log, Params,
+)
 
 class MainWindow(QWidget):
     auto_nm_threshold_um_per_px = 0.10
@@ -241,8 +47,15 @@ class MainWindow(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowIcon(QIcon(str(Path(__file__).resolve().parent.parent / "res" / "app_icon.ico")))
 
+        # Іконка з кореня проєкту: SEMParticleAnalyser/res/app_icon.ico
+        icon_path = Path(__file__).resolve().parents[2] / "res" / "app_icon.ico"
+        if icon_path.exists():
+            icon = QIcon(str(icon_path))
+            self.setWindowIcon(icon)                     # ← для заголовка вікна
+            QApplication.instance().setWindowIcon(icon)  # ← для таскбару
+        else:
+            print(f"[icon] not found: {icon_path}")
         self.setWindowTitle("SEM PSD (Particles Analysis)")
         self.resize(1500, 900)
 
@@ -295,8 +108,6 @@ class MainWindow(QWidget):
 
     # ---------------- UI ----------------
     def build_ui(self):
-        topbar = QHBoxLayout()
-
         self.btn_open = QToolButton()
         self.btn_open.setText("Open image…")
         self.btn_open.setToolTip("Open a SEM image file or a built-in sample.")
@@ -315,7 +126,74 @@ class MainWindow(QWidget):
         self.meta_label = QLabel("Scale: —"); self.meta_label.setStyleSheet("color:#666")
         self.progress = QProgressBar(); self.progress.setRange(0,0); self.progress.setVisible(False); self.progress.setFixedHeight(8); self.progress.setTextVisible(False)
 
-        topbar.addWidget(self.btn_open); topbar.addWidget(self.meta_label); topbar.addStretch(1); topbar.addWidget(self.progress)
+        self._elapsed = QElapsedTimer()
+        self.elapsed_timer = QTimer(self)
+        self.elapsed_timer.setInterval(200)
+        self.elapsed_timer.timeout.connect(self._tick_elapsed)
+        self._is_canceling = False
+        self.elapsed_label = QLabel("⏱ 00:00")
+        self.elapsed_label.setObjectName("elapsedPill")
+        self.elapsed_label.setVisible(False)
+        self.elapsed_label.setMinimumWidth(56)
+
+        self.btn_cancel = QToolButton()
+        self.btn_cancel.setText("✖")
+        self.btn_cancel.setCursor(Qt.PointingHandCursor)
+        self.btn_cancel.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.btn_cancel.setVisible(False)
+        self.btn_cancel.setToolTip("Cancel analysis (Esc)")
+        self.btn_cancel.clicked.connect(self.cancel_analysis)
+        self.setStyleSheet(self.styleSheet() + """
+        QLabel#elapsedPill {
+            color: #333;
+            background: #f6f7f9;
+            border: 1px solid #dfe3e8;
+            border-radius: 10px;
+            padding: 2px 8px;
+            font: 12px "Consolas","Roboto Mono","JetBrains Mono","Menlo","Monaco",monospace;
+        }
+        QLabel#elapsedPill[canceling="true"] {
+            color: #a94442;
+            background: #fbefef;
+            border: 1px solid #f0d9d9;
+        }
+        QToolButton#cancelBtn {
+            border: 1px solid #e1e5ea;
+            border-radius: 6px;
+            background: #ffffff;
+            font: 14px "Segoe UI","Noto Sans";
+            padding: 0;
+        }
+        QToolButton#cancelBtn:hover {
+            background: #f6f7f9;
+        }
+        QToolButton#cancelBtn:pressed {
+            background: #eceff3;
+        }
+        QToolButton#cancelBtn:disabled {
+            color: #aaaaaa;
+            background: #f5f5f5;
+        }
+        """)
+
+        rightBox = QWidget()
+        rbx = QHBoxLayout(rightBox)
+        rbx.setContentsMargins(0, 0, 0, 0)
+        rbx.setSpacing(6)
+        rbx.addWidget(self.progress)
+        rbx.addWidget(self.elapsed_label)
+        rbx.addWidget(self.btn_cancel)
+
+        topbar = QHBoxLayout()
+        topbar.setContentsMargins(8, 4, 8, 4)
+        topbar.setSpacing(8)
+        topbar.addWidget(self.btn_open)
+        topbar.addWidget(self.meta_label)
+        topbar.addStretch(1)
+        topbar.addWidget(self.progress)
+        topbar.addWidget(self.elapsed_label)
+        topbar.addWidget(self.btn_cancel)
+        topbar.addWidget(rightBox)
 
         # Left control panel
         left = QWidget(); form = QFormLayout(left)
@@ -787,11 +665,17 @@ class MainWindow(QWidget):
         self.act_sample2.setShortcutContext(Qt.ApplicationShortcut)
         self.addAction(self.act_sample2)
 
-        # NEW: find by index Ctrl+F
+        # find by index Ctrl+F
         self.act_find = QAction(self, triggered=self.find_particle)
         self.act_find.setShortcut(QKeySequence.Find)
         self.act_find.setShortcutContext(Qt.ApplicationShortcut)
         self.addAction(self.act_find)
+
+        # Cancel processing
+        self.act_cancel = QAction(self, triggered=self.cancel_analysis)
+        self.act_cancel.setShortcut(QKeySequence(Qt.Key_Escape))
+        self.act_cancel.setShortcutContext(Qt.ApplicationShortcut)
+        self.addAction(self.act_cancel)
 
     # ---------- Help ----------
     def show_help(self):
@@ -919,7 +803,7 @@ class MainWindow(QWidget):
         self.update_stats_plus_panel()
 
     def open_sample(self, filename: str):
-        samples_dir = Path(__file__).resolve().parent.parent / "samples"
+        samples_dir = Path(__file__).resolve().parents[2] / "samples"
         p = samples_dir / filename
         if not p.exists():
             QMessageBox.warning(self, "Sample not found", f"File not found:\n{p}")
@@ -1025,6 +909,8 @@ class MainWindow(QWidget):
             self.tabs.setCurrentWidget(self.view_overlay)
 
     def on_worker_failed(self, msg: str):
+        if str(msg) == "__CANCELLED__":
+            return
         QMessageBox.critical(self, "Error", f"Processing failed:\n{msg}")
 
     # ---------- Exclusions ----------
@@ -1404,10 +1290,44 @@ class MainWindow(QWidget):
         )
 
     def set_busy(self, busy: bool):
-        for w in [self.btn_open, self.btn_run, self.btn_export_csv, self.btn_export_ext, self.btn_save_overlay,
-                  self.btn_toggle_remove, self.btn_clear_excl, self.cb_mode, self.btn_autotune]:
+        for w in [self.btn_open, self.btn_run, self.btn_export_csv, self.btn_export_ext,
+                  self.btn_save_overlay, self.btn_toggle_remove, self.btn_clear_excl,
+                  self.cb_mode, self.btn_autotune]:
             w.setEnabled(not busy)
+
         self.progress.setVisible(busy)
+        self.btn_cancel.setVisible(busy)
+        self.elapsed_label.setVisible(busy)
+
+        if busy:
+            self.btn_cancel.setEnabled(True)
+            self.elapsed_label.setProperty("canceling", "false")
+            self.elapsed_label.style().unpolish(self.elapsed_label);
+            self.elapsed_label.style().polish(self.elapsed_label)
+            self._elapsed.restart()
+            self._tick_elapsed()
+            self.elapsed_timer.start()
+        else:
+            self.elapsed_timer.stop()
+            self.elapsed_label.setVisible(False)
+            self.btn_cancel.setVisible(False)
+
+        QApplication.processEvents()
+
+        if busy:
+            self._is_canceling = False
+            self.elapsed_label.setProperty("canceling", "false")
+            self.elapsed_label.style().unpolish(self.elapsed_label);
+            self.elapsed_label.style().polish(self.elapsed_label)
+            self._elapsed.start()
+            self._tick_elapsed()
+            self.elapsed_timer.start()
+        else:
+            self.elapsed_timer.stop()
+            self.elapsed_label.setText("⏱ 00:00")
+            self.elapsed_label.setVisible(False)
+            self.btn_cancel.setVisible(False)
+
         QApplication.processEvents()
 
     # ---------- Find by index (Ctrl+F) ----------
@@ -1431,15 +1351,37 @@ class MainWindow(QWidget):
         self.tabs.setCurrentWidget(self.view_overlay)
         self.render_overlay_with_highlight()
 
+    def cancel_analysis(self):
+        if self._worker is None or self._thread is None:
+            return
+        self.btn_cancel.setEnabled(False)
+        try:
+            if hasattr(self._worker, "cancel"):
+                self._worker.cancel()
+        except Exception:
+            pass
+        try:
+            self._thread.requestInterruption()
+        except Exception:
+            pass
 
-def main():
-    app = QApplication(sys.argv)
-    app.setStyle(ToolTipDelayStyle(app.style()))
-    app.setWindowIcon(QIcon(str(Path(__file__).resolve().parent / "assets" / "app_icon.png")))
-    w = MainWindow()
-    w.show()
-    sys.exit(app.exec())
+    def _tick_elapsed(self):
+        if not self._elapsed.isValid():
+            return
+        sec = self._elapsed.elapsed() // 1000
+        h = sec // 3600
+        m = (sec % 3600) // 60
+        s = sec % 60
+        self.elapsed_label.setText(f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}")
 
+    def on_cancel_clicked(self):
+        self.btn_cancel.setEnabled(False)
+        self.elapsed_label.setProperty("canceling", "true")
+        self.elapsed_label.style().unpolish(self.elapsed_label);
+        self.elapsed_label.style().polish(self.elapsed_label)
 
-if __name__ == "__main__":
-    main()
+        if self._thread and self._thread.isRunning():
+            self._thread.requestInterruption()
+        if self._worker and hasattr(self._worker, "cancel"):
+            self._worker.cancel()
+
